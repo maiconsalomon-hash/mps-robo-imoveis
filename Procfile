@@ -1,1 +1,1 @@
-﻿web: python scraper.py --scheduler
+﻿web: python api.py

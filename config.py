@@ -102,3 +102,8 @@ SYNC_INCREMENTAL_ENABLED = _env_bool("SYNC_INCREMENTAL_ENABLED", True)
 SYNC_FULL_RESYNC_INTERVAL_HOURS = max(1, _env_int("SYNC_FULL_RESYNC_INTERVAL_HOURS", 24))
 # Se a parcela de imóveis “sujos” (passíveis de sync) ≥ este %, forçar sync completo.
 SYNC_INCREMENTAL_FULL_THRESHOLD_PCT = max(1, min(100, _env_int("SYNC_INCREMENTAL_FULL_THRESHOLD_PCT", 35)))
+
+# API REST (Domus / consumo mobile) — api.py + uvicorn
+ROBOT_API_KEY = _env_str("ROBOT_API_KEY", "123") or "123"
+API_PORT = _env_int("API_PORT", 8000)
+API_HOST = _env_str("API_HOST", "0.0.0.0") or "0.0.0.0"

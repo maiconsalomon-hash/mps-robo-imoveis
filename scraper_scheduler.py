@@ -215,6 +215,261 @@ def _setup_stdio_utf8() -> None:
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
+def _scheduler_forever_loop(
+    conn: sqlite3.Connection,
+    root: Path,
+    round_state: dict[str, Any],
+    tz: DtTzInfo,
+    *,
+    run_full_scrape_round: Any,
+    sites: list[dict],
+) -> None:
+    """Loop de agendamento até ``immediate_exit``, ``graceful_stop`` ou pausa por falhas."""
+    while True:
+        if round_state["immediate_exit"]:
+            log.info("Shutdown imediato (sem rodada).")
+            break
+
+        if round_state["failures"] >= SCHEDULE_MAX_CONSECUTIVE_FAILURES:
+            log.error(
+                "SCHEDULER PAUSADO: %s falhas consecutivas. Verificação manual necessária.",
+                round_state["failures"],
+            )
+            cur = read_scheduler_state(root) or {}
+            cur.update(
+                {
+                    "pid": os.getpid(),
+                    "paused": True,
+                    "pause_reason": "max_consecutive_failures",
+                    "consecutive_failures": round_state["failures"],
+                }
+            )
+            write_scheduler_state(root, cur)
+            break
+
+        next_dt = _next_fire_after(SCHEDULE_TIMES, tz)
+        cur = read_scheduler_state(root) or {}
+        cur.update(
+            {
+                "pid": os.getpid(),
+                "scheduler_started_at": cur.get("scheduler_started_at")
+                or datetime.now(timezone.utc).isoformat(),
+                "next_round_at": next_dt.isoformat(),
+                "consecutive_failures": round_state["failures"],
+                "paused": False,
+                "timezone": SCHEDULE_TIMEZONE,
+            }
+        )
+        write_scheduler_state(root, cur)
+
+        while True:
+            if round_state["immediate_exit"]:
+                break
+            if round_state["graceful_stop"] and not round_state["round_running"]:
+                break
+            now = datetime.now(tz)
+            remaining = (next_dt - now).total_seconds()
+            if remaining <= 0:
+                break
+            time.sleep(min(1.0, remaining))
+
+        if round_state["immediate_exit"]:
+            break
+        if round_state["graceful_stop"] and not round_state["round_running"]:
+            log.info("Encerramento após espera: scheduler finalizado.")
+            break
+
+        slot_label = next_dt.isoformat()
+        log.info(
+            "Rodada agendada iniciando às %s [%s]",
+            datetime.now(tz).strftime("%H:%M:%S"),
+            _fmt_hm_local(next_dt),
+        )
+        started_mono = time.monotonic()
+        started_wall = datetime.now(timezone.utc).isoformat()
+        round_state["round_running"] = True
+        try:
+            result = run_full_scrape_round(
+                conn,
+                sites=sites,
+                site_id_filter=None,
+                round_label=started_wall,
+                verbose=True,
+            )
+        finally:
+            round_state["round_running"] = False
+
+        finished_wall = datetime.now(timezone.utc).isoformat()
+        elapsed = int(time.monotonic() - started_mono)
+
+        if result.get("error_message") == "round_lock_busy":
+            log.warning(
+                "Rodada anterior ainda em execução (lock ativo). Pulando horário %s.",
+                _fmt_hm_local(next_dt),
+            )
+            if round_state["graceful_stop"]:
+                log.info("Encerramento após rodada: scheduler finalizado.")
+                break
+            continue
+
+        if not result.get("ok"):
+            round_state["failures"] += 1
+            err = result.get("error_message") or "erro"
+            insert_scheduled_run(
+                conn,
+                scheduled_at=slot_label,
+                started_at=started_wall,
+                finished_at=finished_wall,
+                round_health="ERROR",
+                sites_ok=0,
+                sites_suspeitos=0,
+                sites_erros=0,
+                triggered_by="scheduled",
+                notes=err[:2000],
+                retries_attempted=int(result.get("retries_attempted") or 0),
+                retries_succeeded=int(result.get("retries_succeeded") or 0),
+            )
+            log.error("Rodada falhou (%s). Falhas seguidas: %s", err, round_state["failures"])
+            if round_state["failures"] < SCHEDULE_MAX_CONSECUTIVE_FAILURES:
+                nxt = _next_fire_after(SCHEDULE_TIMES, tz)
+                log.warning(
+                    "ATENÇÃO: %s falha(s) consecutiva(s). Próxima tentativa: %s",
+                    round_state["failures"],
+                    _next_fire_label(nxt, tz),
+                )
+            if round_state["graceful_stop"]:
+                log.info("Encerramento após rodada com falha: scheduler finalizado.")
+                break
+            continue
+
+        round_state["failures"] = 0
+        agg = result.get("round_agg") or {}
+        rh = str(agg.get("round_health") or "UNKNOWN")
+        insert_scheduled_run(
+            conn,
+            scheduled_at=slot_label,
+            started_at=started_wall,
+            finished_at=finished_wall,
+            round_health=rh,
+            sites_ok=int(agg.get("total_ok") or 0),
+            sites_suspeitos=int(agg.get("total_suspeitos") or 0),
+            sites_erros=int(agg.get("total_erros") or 0),
+            triggered_by="scheduled",
+            notes="",
+            retries_attempted=int(result.get("retries_attempted") or 0),
+            retries_succeeded=int(result.get("retries_succeeded") or 0),
+        )
+
+        nxt = _next_fire_after(SCHEDULE_TIMES, tz)
+        log.info(
+            "Rodada concluída: %s | duração %s | próxima: %s",
+            rh,
+            _fmt_duration(elapsed),
+            _next_fire_label(nxt, tz),
+        )
+        cur = read_scheduler_state(root) or {}
+        cur.update(
+            {
+                "pid": os.getpid(),
+                "last_round_finished_at": finished_wall,
+                "last_round_health": rh,
+                "next_round_at": nxt.isoformat(),
+                "consecutive_failures": 0,
+            }
+        )
+        write_scheduler_state(root, cur)
+
+        if round_state["graceful_stop"]:
+            log.info("Encerramento após rodada: scheduler finalizado.")
+            break
+
+
+def run_scheduler_worker(*, install_signals: bool = True) -> None:
+    """Executa o loop do agendador até encerrar. Sem ``sys.exit`` (adequado a thread / API).
+
+    Se ``SCHEDULE_ENABLED`` ou ``SCHEDULE_TIMES`` forem inválidos, registra aviso e retorna.
+    Se não conseguir o lock de instância, registra erro e retorna.
+    """
+    if not SCHEDULE_ENABLED:
+        log.warning("Scheduler não iniciado: SCHEDULE_ENABLED=false.")
+        return
+    if not SCHEDULE_TIMES:
+        log.warning("Scheduler não iniciado: SCHEDULE_TIMES vazio.")
+        return
+
+    from scraper import (  # noqa: WPS433 — import local intencional
+        DB_FILE,
+        SITES,
+        init_db,
+        refresh_site_profiles,
+        run_full_scrape_round,
+    )
+
+    root = Path(__file__).resolve().parent
+    tz = _resolve_tz()
+    instance_lock_path = root / "scheduler_instance.lock"
+    instance = try_acquire_round_lock(instance_lock_path)
+    if instance is None:
+        log.error(
+            "Scheduler não iniciado: lock de instância em uso (%s).",
+            instance_lock_path,
+        )
+        return
+
+    conn = sqlite3.connect(DB_FILE)
+    init_db(conn)
+    refresh_site_profiles(conn)
+
+    round_state: dict[str, Any] = {
+        "round_running": False,
+        "graceful_stop": False,
+        "immediate_exit": False,
+        "failures": 0,
+    }
+
+    if install_signals:
+
+        def on_signal(signum: int, _frame: Any) -> None:
+            name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
+            if not round_state["round_running"]:
+                log.info("%s recebido: encerramento imediato (sem rodada em andamento).", name)
+                round_state["immediate_exit"] = True
+                return
+            round_state["graceful_stop"] = True
+            log.info(
+                "%s recebido: aguardando conclusão da rodada atual antes de encerrar…",
+                name,
+            )
+
+        signal.signal(signal.SIGINT, on_signal)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, on_signal)
+
+    try:
+        first_next = _next_fire_after(SCHEDULE_TIMES, tz)
+        log.info(
+            "Scheduler iniciado. Próxima rodada: %s (%s) (em %s)",
+            _fmt_hm_local(first_next),
+            _next_fire_label(first_next, tz),
+            _fmt_countdown(max(0, (first_next - datetime.now(tz)).total_seconds())),
+        )
+        _scheduler_forever_loop(
+            conn,
+            root,
+            round_state,
+            tz,
+            run_full_scrape_round=run_full_scrape_round,
+            sites=SITES,
+        )
+    finally:
+        instance.release()
+        try:
+            conn.close()
+        except Exception:
+            pass
+        log.info("Scheduler encerrado: lock de instância liberado.")
+
+
 def run_scheduler_main() -> None:
     _setup_stdio_utf8()
 
@@ -227,16 +482,9 @@ def run_scheduler_main() -> None:
         log.error("SCHEDULE_TIMES está vazio. Configure horários (ex.: 06:00,12:00,18:00).")
         sys.exit(1)
 
-    from scraper import (  # noqa: WPS433 — import local intencional
-        DB_FILE,
-        SITES,
-        init_db,
-        refresh_site_profiles,
-        run_full_scrape_round,
-    )
+    from scraper import DB_FILE, SITES, init_db, refresh_site_profiles, run_full_scrape_round  # noqa: WPS433
 
     root = Path(__file__).resolve().parent
-    tz = _resolve_tz()
     instance_lock_path = root / "scheduler_instance.lock"
     instance = try_acquire_round_lock(instance_lock_path)
     if instance is None:
@@ -272,6 +520,7 @@ def run_scheduler_main() -> None:
     signal.signal(signal.SIGINT, on_signal)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, on_signal)
+    tz = _resolve_tz()
 
     try:
         first_next = _next_fire_after(SCHEDULE_TIMES, tz)
@@ -281,165 +530,14 @@ def run_scheduler_main() -> None:
             _next_fire_label(first_next, tz),
             _fmt_countdown(max(0, (first_next - datetime.now(tz)).total_seconds())),
         )
-
-        while True:
-            if round_state["immediate_exit"]:
-                log.info("Shutdown imediato (sem rodada).")
-                break
-
-            if round_state["failures"] >= SCHEDULE_MAX_CONSECUTIVE_FAILURES:
-                log.error(
-                    "SCHEDULER PAUSADO: %s falhas consecutivas. Verificação manual necessária.",
-                    round_state["failures"],
-                )
-                cur = read_scheduler_state(root) or {}
-                cur.update(
-                    {
-                        "pid": os.getpid(),
-                        "paused": True,
-                        "pause_reason": "max_consecutive_failures",
-                        "consecutive_failures": round_state["failures"],
-                    }
-                )
-                write_scheduler_state(root, cur)
-                break
-
-            next_dt = _next_fire_after(SCHEDULE_TIMES, tz)
-            cur = read_scheduler_state(root) or {}
-            cur.update(
-                {
-                    "pid": os.getpid(),
-                    "scheduler_started_at": cur.get("scheduler_started_at")
-                    or datetime.now(timezone.utc).isoformat(),
-                    "next_round_at": next_dt.isoformat(),
-                    "consecutive_failures": round_state["failures"],
-                    "paused": False,
-                    "timezone": SCHEDULE_TIMEZONE,
-                }
-            )
-            write_scheduler_state(root, cur)
-
-            while True:
-                if round_state["immediate_exit"]:
-                    break
-                if round_state["graceful_stop"] and not round_state["round_running"]:
-                    break
-                now = datetime.now(tz)
-                remaining = (next_dt - now).total_seconds()
-                if remaining <= 0:
-                    break
-                time.sleep(min(1.0, remaining))
-
-            if round_state["immediate_exit"]:
-                break
-            if round_state["graceful_stop"] and not round_state["round_running"]:
-                log.info("Encerramento após espera: scheduler finalizado.")
-                break
-
-            slot_label = next_dt.isoformat()
-            log.info(
-                "Rodada agendada iniciando às %s [%s]",
-                datetime.now(tz).strftime("%H:%M:%S"),
-                _fmt_hm_local(next_dt),
-            )
-            started_mono = time.monotonic()
-            started_wall = datetime.now(timezone.utc).isoformat()
-            round_state["round_running"] = True
-            try:
-                result = run_full_scrape_round(
-                    conn,
-                    sites=SITES,
-                    site_id_filter=None,
-                    round_label=started_wall,
-                    verbose=True,
-                )
-            finally:
-                round_state["round_running"] = False
-
-            finished_wall = datetime.now(timezone.utc).isoformat()
-            elapsed = int(time.monotonic() - started_mono)
-
-            if result.get("error_message") == "round_lock_busy":
-                log.warning(
-                    "Rodada anterior ainda em execução (lock ativo). Pulando horário %s.",
-                    _fmt_hm_local(next_dt),
-                )
-                if round_state["graceful_stop"]:
-                    log.info("Encerramento após rodada: scheduler finalizado.")
-                    break
-                continue
-
-            if not result.get("ok"):
-                round_state["failures"] += 1
-                err = result.get("error_message") or "erro"
-                insert_scheduled_run(
-                    conn,
-                    scheduled_at=slot_label,
-                    started_at=started_wall,
-                    finished_at=finished_wall,
-                    round_health="ERROR",
-                    sites_ok=0,
-                    sites_suspeitos=0,
-                    sites_erros=0,
-                    triggered_by="scheduled",
-                    notes=err[:2000],
-                    retries_attempted=int(result.get("retries_attempted") or 0),
-                    retries_succeeded=int(result.get("retries_succeeded") or 0),
-                )
-                log.error("Rodada falhou (%s). Falhas seguidas: %s", err, round_state["failures"])
-                if round_state["failures"] < SCHEDULE_MAX_CONSECUTIVE_FAILURES:
-                    nxt = _next_fire_after(SCHEDULE_TIMES, tz)
-                    log.warning(
-                        "ATENÇÃO: %s falha(s) consecutiva(s). Próxima tentativa: %s",
-                        round_state["failures"],
-                        _next_fire_label(nxt, tz),
-                    )
-                if round_state["graceful_stop"]:
-                    log.info("Encerramento após rodada com falha: scheduler finalizado.")
-                    break
-                continue
-
-            round_state["failures"] = 0
-            agg = result.get("round_agg") or {}
-            rh = str(agg.get("round_health") or "UNKNOWN")
-            insert_scheduled_run(
-                conn,
-                scheduled_at=slot_label,
-                started_at=started_wall,
-                finished_at=finished_wall,
-                round_health=rh,
-                sites_ok=int(agg.get("total_ok") or 0),
-                sites_suspeitos=int(agg.get("total_suspeitos") or 0),
-                sites_erros=int(agg.get("total_erros") or 0),
-                triggered_by="scheduled",
-                notes="",
-                retries_attempted=int(result.get("retries_attempted") or 0),
-                retries_succeeded=int(result.get("retries_succeeded") or 0),
-            )
-
-            nxt = _next_fire_after(SCHEDULE_TIMES, tz)
-            log.info(
-                "Rodada concluída: %s | duração %s | próxima: %s",
-                rh,
-                _fmt_duration(elapsed),
-                _next_fire_label(nxt, tz),
-            )
-            cur = read_scheduler_state(root) or {}
-            cur.update(
-                {
-                    "pid": os.getpid(),
-                    "last_round_finished_at": finished_wall,
-                    "last_round_health": rh,
-                    "next_round_at": nxt.isoformat(),
-                    "consecutive_failures": 0,
-                }
-            )
-            write_scheduler_state(root, cur)
-
-            if round_state["graceful_stop"]:
-                log.info("Encerramento após rodada: scheduler finalizado.")
-                break
-
+        _scheduler_forever_loop(
+            conn,
+            root,
+            round_state,
+            tz,
+            run_full_scrape_round=run_full_scrape_round,
+            sites=SITES,
+        )
     finally:
         instance.release()
         try:
