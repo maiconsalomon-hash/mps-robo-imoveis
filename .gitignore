@@ -1,0 +1,28 @@
+﻿# Ambiente
+.env
+
+# Banco de dados local
+*.db
+*.db-journal
+
+# Locks do scheduler
+scrape_round.lock
+scheduler_instance.lock
+scheduler_state.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log
+
+# VS Code / Cursor
+.vscode/
+.cursor/
+
+# Windows
+Thumbs.db
+desktop.ini

@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "description": "Cada item em 'profiles' liga host(s) a uma chave em EXTRACTOR_REGISTRY (scraper.py). Prioridade: embutido (BUILTIN_HOST_EXTRACTOR) → este JSON → SQLite site_scrape_profiles. Chaves atuais: imonov_webflow (cards Webflow/Morada); apreme (Apre.me, URLs /codigo ou /imovel/…). Itaivan (itaivan.com) tem tratamento dedicato no código — não precisa perfil. Ex.: {\"extractor\":\"apreme\",\"host_match\":[\"imobiliaria-apre.exemplo.com.br\"],\"notes\":\"white-label Apre\"}",
+  "profiles": []
+}
