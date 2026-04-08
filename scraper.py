@@ -20,10 +20,15 @@ Perfis de extração: ``site_profiles.json`` + tabela ``site_scrape_profiles`` n
 alterar código, desde que exista em EXTRACTOR_REGISTRY — ex.: ``imonov_webflow`` (Morada /
 Webflow), ``apreme`` (Apre.me / links ``/12345`` ou ``/imovel/…``). Itaivan usa ramo próprio
 (``extract_imoveis_itaivan`` + Playwright), não o mapa por host.
+Sites Next.js da família Tecimob / Gerenciar Imóveis CF (URLs ``/comprar/imoveis`` ou
+``/comprar-alugar/imoveis`` com ``offset`` + ``limit``) são detectados por
+``detect_platform_family`` e coletados pela API pública com header ``x-domain``, sem depender
+de cards no HTML (evita ``ERRO_LISTAGEM_INVALIDA`` nesse shell).
 """
 
 import sqlite3
 import json
+import math
 import time
 import csv
 import re
@@ -33,10 +38,11 @@ import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
-from urllib.parse import urljoin, urlparse
+from typing import Any, Callable
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
+from requests import exceptions as requests_exceptions
 from bs4 import BeautifulSoup
 
 try:
@@ -140,6 +146,13 @@ from site_health_history import (  # noqa: E402 — MINI-ETAPA 6B
     migrate_site_health_alert_events,
     persist_health_alerts_for_round,
 )
+from migrations.apply_imovel_lifecycle_historico import (  # noqa: E402
+    migrate_imoveis_lifecycle,
+    migrate_imoveis_preco_numeric,
+    migrate_imovel_historico,
+    migrate_imoveis_site_canonical_unique,
+    migrate_site_listing_snapshots,
+)
 from site_retry import pick_retry_candidates  # noqa: E402 — MINI-ETAPA 7B
 from sync_quality_filter import (  # noqa: E402 — MINI-ETAPA 8A
     classify_sync_filter_row,
@@ -155,6 +168,9 @@ REQUEST_TIMEOUT = 20          # segundos por requisição
 DELAY_BETWEEN_SITES = 2       # segundos entre sites (respeita os servidores)
 MAX_PAGES_PER_SITE = 50       # máximo de páginas por imobiliária (cobre até ~1000 imóveis)
 ITAIVAN_MAX_PAGES = 80        # Itaivan (Playwright): listagem filtrada pode ter 50+ páginas (ex.: 58)
+# Remoções entre runs: queda forte vs. snapshot anterior → não marcar REMOVED (listagem provavelmente incompleta).
+REMOVALS_PREVIOUS_KEYS_MIN_FOR_RATIO = 8
+REMOVALS_CURRENT_VS_PREVIOUS_MIN_RATIO = 0.35
 # Fim de listagem: após páginas “cheias”, muitos sites (ex.: Morada Brasil) ainda respondem
 # /pag/N+1 com poucos cards (destaques/sidebar), sem a grade real — corta paginação em falso.
 # (Regras numéricas espelhadas em ``pagination_cutoff`` — manter alinhado.)
@@ -247,6 +263,7 @@ def init_db(conn):
         finalidade    TEXT DEFAULT 'venda',
         preco         REAL,
         preco_texto   TEXT,
+        preco_numeric REAL,
         area_m2       REAL,
         quartos       INTEGER,
         banheiros     INTEGER,
@@ -270,6 +287,11 @@ def init_db(conn):
         ativo         INTEGER DEFAULT 1,    -- 1=ativo, 0=saiu do mercado
         primeira_vez  TEXT,                 -- data que apareceu pela 1ª vez
         ultima_vez    TEXT,                 -- data da última atualização
+        primeira_coleta  DATETIME,          -- ciclo de vida (migração; ver migrate_imoveis_lifecycle)
+        ultima_coleta    DATETIME,
+        removed_at       DATETIME,
+        reappeared_at    DATETIME,
+        total_coletas    INTEGER NOT NULL DEFAULT 0,
         raw_json      TEXT                  -- dados brutos extraídos
     );
 
@@ -316,9 +338,15 @@ def init_db(conn):
     migrate_site_health_alert_events(conn)
     migrate_imoveis_identity(conn)
     migrate_imoveis_field_quality(conn)
+    migrate_imoveis_lifecycle(conn)
+    migrate_imoveis_preco_numeric(conn)
+    migrate_imovel_historico(conn)
+    migrate_imoveis_site_canonical_unique(conn, log.warning)
+    migrate_site_listing_snapshots(conn)
     migrate_scheduled_runs(conn)
     migrate_scheduled_runs_retry_columns(conn)
     migrate_supabase_sync_state(conn)
+    backfill_imoveis_preco_numeric(conn)
 
 
 def migrate_scheduled_runs(conn):
@@ -533,19 +561,80 @@ def make_hash(data: dict) -> str:
     return legacy_content_hash(data)
 
 
-def parse_preco(texto: str) -> float | None:
-    """Extrai valor numérico de strings como 'R$ 450.000,00'."""
-    if not texto:
+def normalize_price(value: Any) -> float | None:
+    """
+    Normaliza preço brasileiro para ``float``: remove ``R$``, remove pontos de milhar,
+    troca vírgula decimal por ponto.
+
+    Aceita também ``int``/``float`` (retorna ``float`` coerente).
+
+    Exemplos:
+        >>> normalize_price("R$ 1.234.567,89")
+        1234567.89
+        >>> normalize_price("450000,50")
+        450000.5
+        >>> normalize_price(320000)
+        320000.0
+        >>> normalize_price("consulte") is None
+        True
+    """
+    if value is None:
         return None
-    nums = re.sub(r"[^\d,]", "", texto).replace(",", ".")
-    # remove pontos de milhar deixando só a vírgula decimal
-    parts = nums.split(".")
-    if len(parts) > 2:
-        nums = "".join(parts[:-1]) + "." + parts[-1]
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+            return None
+        return float(value)
+    s = str(value).strip()
+    if not s:
+        return None
+    lo = s.lower()
+    if lo in ("consulte", "sob consulta", "sobconsulta", "n/d", "nd", "-", "—"):
+        return None
+    t = re.sub(r"r\$\s*", "", s, flags=re.IGNORECASE).strip()
+    t = re.sub(r"\s+", "", t)
+    t = t.replace(".", "")
+    t = t.replace(",", ".")
+    if not re.fullmatch(r"\d+(?:\.\d+)?", t):
+        return None
     try:
-        return float(nums)
+        return float(t)
     except ValueError:
         return None
+
+
+def parse_preco(texto: str) -> float | None:
+    """Extrai valor numérico de strings como 'R$ 450.000,00' (usa ``normalize_price``)."""
+    return normalize_price(texto)
+
+
+def ensure_imovel_preco_fields(im: dict) -> float | None:
+    """
+    Preenche ``im["preco_numeric"]`` e alinha ``im["preco"]`` ao valor canônico quando parseável.
+    Deve ser chamado no pipeline antes de ``evaluate_field_quality`` / persistência.
+    """
+    n = normalize_price(im.get("preco"))
+    if n is None:
+        n = normalize_price(im.get("preco_texto") or "")
+    im["preco_numeric"] = n
+    if n is not None:
+        im["preco"] = n
+    return n
+
+
+def backfill_imoveis_preco_numeric(conn: sqlite3.Connection) -> None:
+    """Preenche ``preco_numeric`` em linhas antigas (idempotente por NULL)."""
+    rows = conn.execute(
+        "SELECT id, preco, preco_texto FROM imoveis WHERE preco_numeric IS NULL"
+    ).fetchall()
+    for rid, p, pt in rows:
+        n = normalize_price(p)
+        if n is None:
+            n = normalize_price(pt or "")
+        conn.execute("UPDATE imoveis SET preco_numeric = ? WHERE id = ?", (n, rid))
+    if rows:
+        conn.commit()
 
 
 def parse_area(texto: str) -> float | None:
@@ -1202,6 +1291,561 @@ def extract_imoveis_generic(html: str, base_url: str, site: dict) -> list[dict]:
     return _extract_imoveis_generic_main(html, base_url, site)
 
 
+# ── Família Tecimob / Gerenciar Imóveis CF (front Next.js + API com header x-domain) ──
+# Sites como mouraimoveis, lotusimoveissc entregam shell HTML sem cards; a listagem vem de
+# ``api-sites2.gerenciarimoveis-cf.com.br/api/properties`` (não confundir com Kenlo legado em HTML).
+
+GERENCIAR_IMOVEIS_CF_API_PROPERTIES = (
+    "https://api-sites2.gerenciarimoveis-cf.com.br/api/properties"
+)
+
+PLATFORM_FAMILY_GENERIC = "generic"
+PLATFORM_FAMILY_GERENCIAR_IMOVEIS_CF = "gerenciarimoveis_cf"
+
+# Códigos de probe (API-first / operação)
+GERENCIAR_CF_PROBE_SUCCEEDED = "api_probe_succeeded"
+GERENCIAR_CF_PROBE_SUCCEEDED_EMPTY = "api_probe_succeeded_but_empty"
+GERENCIAR_CF_PROBE_TIMEOUT = "api_probe_timeout"
+GERENCIAR_CF_PROBE_HTTP = "api_probe_http_error"
+GERENCIAR_CF_PROBE_NOT_JSON = "api_probe_not_json"
+GERENCIAR_CF_PROBE_INVALID_JSON = "api_probe_invalid_json"
+GERENCIAR_CF_PROBE_SCHEMA = "api_probe_schema_unexpected"
+GERENCIAR_CF_PROBE_FAILED = "api_probe_failed"
+GERENCIAR_CF_PROBE_DOMAIN_MISMATCH = "api_domain_header_mismatch"
+
+# Registro de famílias cujo extrator principal é API (extensível)
+API_FIRST_FAMILY_REGISTRY: dict[str, Callable[..., Any]] = {}
+
+
+def _netloc_for_x_domain(listing_url: str) -> str:
+    host = (urlparse(listing_url).netloc or "").lower().strip()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _x_domain_header_candidates(listing_url: str) -> list[str]:
+    """Ordem: host sem www primeiro, depois host original (ex.: www.), sem duplicar."""
+    raw = (urlparse(listing_url).netloc or "").lower().strip()
+    stripped = raw[4:] if raw.startswith("www.") else raw
+    out: list[str] = []
+    for h in (stripped, raw):
+        if h and h not in out:
+            out.append(h)
+    return out
+
+
+def _listing_query_int(listing_url: str, key: str, default: int) -> int:
+    q = parse_qs(urlparse(listing_url).query)
+    vals = q.get(key) or []
+    if not vals:
+        return default
+    try:
+        return max(1, int(vals[0]))
+    except ValueError:
+        return default
+
+
+def listing_url_signals_gerenciar_imoveis_cf(listing_url: str) -> bool:
+    """
+    Padrão de URL de listagem observado na família (comprar|alugar|comprar-alugar)/imoveis
+    com paginação offset+limit (o parâmetro ``offset`` na API é índice de página, não skip em itens).
+    """
+    pu = urlparse(listing_url)
+    path_l = (pu.path or "").lower().rstrip("/")
+    q_l = (pu.query or "").lower()
+    if "offset=" not in q_l or "limit=" not in q_l:
+        return False
+    if not re.search(r"/(comprar|alugar|comprar-alugar)/imoveis$", path_l):
+        return False
+    return True
+
+
+def next_data_suggests_nextjs_list_page(html: str) -> bool:
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html or "", re.DOTALL)
+    if not m:
+        return False
+    try:
+        payload = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return False
+    return payload.get("page") == "/list"
+
+
+def _classify_gerenciar_cf_probe_response(
+    r: requests.Response,
+) -> tuple[str, dict[str, Any] | None]:
+    """
+    Interpreta uma resposta HTTP já recebida. Retorna (status_probe, body_parseado_ou_None).
+    """
+    if r.status_code != 200:
+        return f"{GERENCIAR_CF_PROBE_HTTP}:{r.status_code}", None
+    ct = (r.headers.get("content-type") or "").lower()
+    if "json" not in ct:
+        return f"{GERENCIAR_CF_PROBE_NOT_JSON}:{ct[:48]}", None
+    try:
+        body = r.json()
+    except json.JSONDecodeError:
+        return GERENCIAR_CF_PROBE_INVALID_JSON, None
+    if not isinstance(body, dict):
+        return GERENCIAR_CF_PROBE_SCHEMA, None
+    data = body.get("data")
+    if not isinstance(data, list):
+        return GERENCIAR_CF_PROBE_SCHEMA, None
+    if len(data) == 0:
+        return GERENCIAR_CF_PROBE_SUCCEEDED_EMPTY, body
+    first = data[0]
+    if not isinstance(first, dict) or not (first.get("url") or "").strip():
+        return GERENCIAR_CF_PROBE_SCHEMA, None
+    return GERENCIAR_CF_PROBE_SUCCEEDED, body
+
+
+def probe_gerenciar_imoveis_cf_api_resilient(
+    session: requests.Session, listing_url: str
+) -> dict[str, Any]:
+    """
+    Testa ``x-domain`` em variantes (sem www, depois host original). Retorna dict com:
+    ok, probe_status, x_domain_host_used, variants_tried, last_http_status.
+    """
+    out: dict[str, Any] = {
+        "ok": False,
+        "probe_status": GERENCIAR_CF_PROBE_DOMAIN_MISMATCH,
+        "x_domain_host_used": "",
+        "variants_tried": [],
+        "last_http_status": None,
+    }
+    candidates = _x_domain_header_candidates(listing_url)
+    if not candidates:
+        out["probe_status"] = GERENCIAR_CF_PROBE_FAILED
+        out["variants_tried"].append({"host": "", "status": "empty_netloc"})
+        return out
+
+    url = f"{GERENCIAR_IMOVEIS_CF_API_PROPERTIES}?offset=1&limit=3"
+    last_status: str = GERENCIAR_CF_PROBE_DOMAIN_MISMATCH
+
+    for host in candidates:
+        entry: dict[str, Any] = {"host": host, "probe_status": "", "http_status": None}
+        try:
+            r = session.get(
+                url,
+                headers={
+                    **HEADERS,
+                    "Accept": "application/json",
+                    "x-domain": host,
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests_exceptions.Timeout:
+            entry["probe_status"] = GERENCIAR_CF_PROBE_TIMEOUT
+            out["variants_tried"].append(entry)
+            last_status = GERENCIAR_CF_PROBE_TIMEOUT
+            continue
+        except requests_exceptions.RequestException as e:
+            et, em = format_exception(e)
+            entry["probe_status"] = f"{GERENCIAR_CF_PROBE_FAILED}:{et}"
+            out["variants_tried"].append(entry)
+            last_status = entry["probe_status"]
+            continue
+        except OSError as e:
+            et, em = format_exception(e)
+            entry["probe_status"] = f"{GERENCIAR_CF_PROBE_FAILED}:{et}"
+            out["variants_tried"].append(entry)
+            last_status = entry["probe_status"]
+            continue
+
+        entry["http_status"] = r.status_code
+        st, _body = _classify_gerenciar_cf_probe_response(r)
+        entry["probe_status"] = st
+        out["variants_tried"].append(entry)
+        out["last_http_status"] = r.status_code
+        last_status = st
+
+        if st == GERENCIAR_CF_PROBE_SUCCEEDED:
+            out["ok"] = True
+            out["probe_status"] = st
+            out["x_domain_host_used"] = host
+            return out
+        if st == GERENCIAR_CF_PROBE_SUCCEEDED_EMPTY:
+            out["ok"] = True
+            out["probe_status"] = st
+            out["x_domain_host_used"] = host
+            return out
+
+    out["probe_status"] = last_status
+    http_codes: list[int] = []
+    for v in out["variants_tried"]:
+        if isinstance(v, dict) and v.get("http_status") is not None:
+            try:
+                http_codes.append(int(v["http_status"]))
+            except (TypeError, ValueError):
+                pass
+    if http_codes and all(400 <= c < 500 for c in http_codes):
+        out["probe_status"] = GERENCIAR_CF_PROBE_DOMAIN_MISMATCH
+    return out
+
+
+def detect_platform_family(
+    listing_url: str, html: str | None, session: requests.Session
+) -> tuple[str, dict[str, Any]]:
+    """
+    Retorna (family, diagnóstico). ``gerenciarimoveis_cf`` só após assinatura de URL + probe
+    com schema válido (inclui lista vazia: inventário zero no site).
+    """
+    diag: dict[str, Any] = {
+        "listing_url_signal": False,
+        "next_data_list": False,
+        "gerenciar_cf_api_probe_used": False,
+        "api_probe_ok": False,
+        "probe_status": "",
+        "x_domain_host_used": "",
+        "detail_domain": _netloc_for_x_domain(listing_url),
+        "variants_tried": [],
+    }
+    if not listing_url_signals_gerenciar_imoveis_cf(listing_url):
+        return PLATFORM_FAMILY_GENERIC, diag
+
+    diag["listing_url_signal"] = True
+    diag["gerenciar_cf_api_probe_used"] = True
+    if html and next_data_suggests_nextjs_list_page(html):
+        diag["next_data_list"] = True
+
+    probe = probe_gerenciar_imoveis_cf_api_resilient(session, listing_url)
+    diag["variants_tried"] = probe.get("variants_tried") or []
+    diag["probe_status"] = probe.get("probe_status") or ""
+    diag["api_probe_ok"] = bool(probe.get("ok"))
+    diag["x_domain_host_used"] = probe.get("x_domain_host_used") or ""
+
+    if probe.get("ok"):
+        return PLATFORM_FAMILY_GERENCIAR_IMOVEIS_CF, diag
+    return PLATFORM_FAMILY_GENERIC, diag
+
+
+def _split_gerenciar_formatted_address(addr: str) -> tuple[str, str]:
+    s = (addr or "").strip()
+    if not s:
+        return "", ""
+    if " - " in s:
+        left, right = s.rsplit(" - ", 1)
+        bairro = left.strip()
+        cidade = right.split("/")[0].strip() if "/" in right else right.strip()
+        return bairro[:120], cidade[:120]
+    if "/" in s:
+        return "", s.split("/")[0].strip()[:120]
+    return "", s[:120]
+
+
+def _imovel_dict_from_gerenciar_cf(
+    prop: dict[str, Any], site: dict, scheme: str, domain: str
+) -> dict[str, Any] | None:
+    rel = (prop.get("url") or "").strip().strip("/")
+    if not rel:
+        return None
+    detail = f"{scheme}://{domain}/imovel/{rel}"
+    titulo = (prop.get("meta_title") or prop.get("title_formatted") or "").strip() or "Imóvel"
+    preco_texto = (prop.get("total_price") or prop.get("price") or "").strip()
+    tx = (prop.get("transaction") or "").strip().upper()
+    if tx == "ALUGUEL" or "ALUG" in tx:
+        finalidade = "alugar"
+    else:
+        finalidade = "venda"
+
+    area_m2 = None
+    areas = prop.get("areas") or {}
+    if isinstance(areas, dict):
+        prim = areas.get("primary_area")
+        if isinstance(prim, dict):
+            raw_v = (prim.get("value") or "").strip().replace(".", "").replace(",", ".")
+            try:
+                area_m2 = float(raw_v)
+            except ValueError:
+                area_m2 = None
+
+    rooms = prop.get("rooms") if isinstance(prop.get("rooms"), dict) else {}
+    quartos = None
+    banheiros = None
+    vagas = None
+    if isinstance(rooms, dict):
+        bed = rooms.get("bedroom")
+        if isinstance(bed, dict):
+            try:
+                quartos = int(bed.get("value"))
+            except (TypeError, ValueError):
+                quartos = None
+        bath = rooms.get("bathroom")
+        if isinstance(bath, dict):
+            try:
+                banheiros = int(bath.get("value"))
+            except (TypeError, ValueError):
+                banheiros = None
+        gar = rooms.get("garage")
+        if isinstance(gar, dict):
+            try:
+                vagas = int(gar.get("value"))
+            except (TypeError, ValueError):
+                vagas = None
+
+    addr = ""
+    if isinstance(prop.get("address"), dict):
+        addr = (prop["address"].get("formatted") or "").strip()
+    bairro, cidade = _split_gerenciar_formatted_address(addr)
+    if not cidade:
+        cidade = "Jaraguá do Sul"
+
+    codigo = str(prop.get("reference") or "").strip()
+
+    return {
+        "site_id": site["id"],
+        "site_name": site["name"],
+        "titulo": titulo[:200],
+        "tipo": detect_tipo(titulo + " " + (prop.get("profile") or "")),
+        "finalidade": finalidade,
+        "preco_texto": preco_texto,
+        "preco": parse_preco(preco_texto) if preco_texto and preco_texto.lower() != "consulte" else None,
+        "area_m2": area_m2,
+        "quartos": quartos,
+        "banheiros": banheiros,
+        "vagas": vagas,
+        "bairro": bairro,
+        "cidade": cidade,
+        "endereco": addr[:300] if addr else "",
+        "descricao": "",
+        "url_anuncio": detail,
+        "url_foto": "",
+        "codigo": codigo,
+    }
+
+
+GERENCIAR_CF_STOP_COMPLETED = "completed_all_pages"
+GERENCIAR_CF_STOP_MAX_CAP = "capped_max_pages_per_site"
+GERENCIAR_CF_STOP_PARTIAL_BATCH = "last_page_partial_batch"
+GERENCIAR_CF_STOP_EMPTY_AFTER_START = "empty_page_after_prior_data"
+GERENCIAR_CF_STOP_SCHEMA = "schema_invalid_mid_run"
+GERENCIAR_CF_STOP_HTTP = "api_pagination_failed_mid_run"
+GERENCIAR_CF_STOP_DEDUP_STALL = "no_new_unique_items_repeated_page"
+GERENCIAR_CF_STOP_FIRST_PAGE_EMPTY = "empty_first_page_api"
+
+
+def extract_imoveis_gerenciar_imoveis_cf_api(
+    session: requests.Session,
+    listing_url: str,
+    site: dict,
+    *,
+    api_x_domain: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    Baixa páginas na API pública. ``api_x_domain`` deve ser o host que passou no probe
+    (pode diferir de ``www`` vs sem www). URLs de detalhe usam ``detail_domain`` da listagem.
+    """
+    detail_domain = _netloc_for_x_domain(listing_url)
+    scheme = urlparse(listing_url).scheme or "https"
+    limit = _listing_query_int(listing_url, "limit", 21)
+    meta_out: dict[str, Any] = {
+        "pagination_pattern": "api_properties_offset_as_page_index",
+        "x_domain_api_header": api_x_domain,
+        "detail_domain": detail_domain,
+        "limit": limit,
+        "pages_fetched": 0,
+        "total_items": 0,
+        "detail_links": 0,
+        "validation_reason": "",
+        "last_error": "",
+        "stop_reason": "",
+        "total_pages_reported": None,
+        "unique_slugs_seen": 0,
+        "duplicates_skipped": 0,
+    }
+
+    if not api_x_domain:
+        meta_out["stop_reason"] = GERENCIAR_CF_PROBE_FAILED
+        meta_out["validation_reason"] = "missing_api_x_domain"
+        meta_out["last_error"] = "api_x_domain_empty"
+        return [], meta_out
+
+    all_props: list[dict[str, Any]] = []
+    seen_slugs: set[str] = set()
+    max_pages_allowed = MAX_PAGES_PER_SITE
+    page_idx = 1
+    had_any_rows = False
+    prior_page_fingerprint: str | None = None
+
+    while page_idx <= max_pages_allowed:
+        api_url = f"{GERENCIAR_IMOVEIS_CF_API_PROPERTIES}?offset={page_idx}&limit={limit}"
+        try:
+            r = session.get(
+                api_url,
+                headers={
+                    **HEADERS,
+                    "Accept": "application/json",
+                    "x-domain": api_x_domain,
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+            r.raise_for_status()
+            body = r.json()
+        except requests_exceptions.Timeout as e:
+            et, em = format_exception(e)
+            meta_out["last_error"] = f"{et}: {em}"
+            meta_out["stop_reason"] = (
+                GERENCIAR_CF_STOP_HTTP if had_any_rows else GERENCIAR_CF_PROBE_TIMEOUT
+            )
+            log.warning(
+                "Gerenciar CF API: timeout página %s — %s",
+                page_idx,
+                site["name"],
+            )
+            break
+        except requests_exceptions.RequestException as e:
+            et, em = format_exception(e)
+            meta_out["last_error"] = f"{et}: {em}"
+            meta_out["stop_reason"] = GERENCIAR_CF_STOP_HTTP if had_any_rows else GERENCIAR_CF_PROBE_FAILED
+            log.warning(
+                "Gerenciar CF API: falha rede/HTTP página %s para %s — %s",
+                page_idx,
+                site["name"],
+                meta_out["last_error"],
+            )
+            break
+        except (json.JSONDecodeError, ValueError) as e:
+            et, em = format_exception(e)
+            meta_out["last_error"] = f"{et}: {em}"
+            meta_out["stop_reason"] = GERENCIAR_CF_STOP_SCHEMA
+            log.warning(
+                "Gerenciar CF API: JSON inválido página %s — %s",
+                page_idx,
+                site["name"],
+            )
+            break
+
+        if not isinstance(body, dict):
+            meta_out["stop_reason"] = GERENCIAR_CF_STOP_SCHEMA
+            meta_out["last_error"] = "body_not_object"
+            break
+
+        rows = body.get("data")
+        if not isinstance(rows, list):
+            meta_out["stop_reason"] = GERENCIAR_CF_STOP_SCHEMA
+            meta_out["last_error"] = "data_not_list"
+            break
+
+        if not rows:
+            if had_any_rows:
+                meta_out["stop_reason"] = GERENCIAR_CF_STOP_EMPTY_AFTER_START
+            else:
+                meta_out["stop_reason"] = GERENCIAR_CF_STOP_FIRST_PAGE_EMPTY
+            break
+
+        had_any_rows = True
+        meta_out["pages_fetched"] = page_idx
+
+        pagination = (body.get("meta") or {}).get("pagination")
+        if isinstance(pagination, dict):
+            try:
+                tp = int(pagination.get("total_pages") or 0)
+            except (TypeError, ValueError):
+                tp = 0
+            if tp > 0:
+                max_pages_allowed = min(MAX_PAGES_PER_SITE, tp)
+                meta_out["total_pages_reported"] = tp
+
+        new_in_page = 0
+        fp_parts: list[str] = []
+        for prop in rows:
+            if not isinstance(prop, dict):
+                continue
+            slug = (prop.get("url") or "").strip()
+            fp_parts.append(slug[:48] if slug else "")
+            if not slug:
+                continue
+            if slug in seen_slugs:
+                meta_out["duplicates_skipped"] = int(meta_out.get("duplicates_skipped") or 0) + 1
+                continue
+            seen_slugs.add(slug)
+            item = _imovel_dict_from_gerenciar_cf(prop, site, scheme, detail_domain)
+            if item:
+                all_props.append(item)
+                new_in_page += 1
+
+        page_fp = "|".join(fp_parts[:5])
+        if (
+            prior_page_fingerprint is not None
+            and page_fp == prior_page_fingerprint
+            and new_in_page == 0
+        ):
+            meta_out["stop_reason"] = GERENCIAR_CF_STOP_DEDUP_STALL
+            log.warning(
+                "Gerenciar CF API: página %s repetida sem novos itens — %s",
+                page_idx,
+                site["name"],
+            )
+            break
+        prior_page_fingerprint = page_fp
+
+        if page_idx >= max_pages_allowed:
+            rep = meta_out.get("total_pages_reported")
+            if max_pages_allowed >= MAX_PAGES_PER_SITE and (rep is None or rep > MAX_PAGES_PER_SITE):
+                meta_out["stop_reason"] = GERENCIAR_CF_STOP_MAX_CAP
+            else:
+                meta_out["stop_reason"] = GERENCIAR_CF_STOP_COMPLETED
+            break
+
+        if len(rows) < limit:
+            meta_out["stop_reason"] = GERENCIAR_CF_STOP_PARTIAL_BATCH
+            break
+
+        page_idx += 1
+
+    if not meta_out["stop_reason"] and meta_out["pages_fetched"] > 0:
+        meta_out["stop_reason"] = GERENCIAR_CF_STOP_COMPLETED
+
+    meta_out["unique_slugs_seen"] = len(seen_slugs)
+    meta_out["total_items"] = len(all_props)
+    meta_out["detail_links"] = sum(1 for x in all_props if x.get("url_anuncio"))
+    if all_props:
+        meta_out["validation_reason"] = "api_returned_property_records_with_detail_urls"
+    elif meta_out.get("last_error"):
+        meta_out["validation_reason"] = "api_error_or_abort"
+    else:
+        meta_out["validation_reason"] = "api_empty_no_rows"
+
+    log.info(
+        "Gerenciar CF API: %s — %s imóveis | %s página(s) API | stop=%s | x-domain=%s | detalhe host=%s",
+        site["name"],
+        meta_out["total_items"],
+        meta_out["pages_fetched"],
+        meta_out.get("stop_reason") or "?",
+        api_x_domain,
+        detail_domain,
+    )
+    return all_props, meta_out
+
+
+def _register_api_first_families() -> None:
+    """Registro tardio: evita NameError na definição da função."""
+    API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_GERENCIAR_IMOVEIS_CF] = extract_imoveis_gerenciar_imoveis_cf_api
+
+
+_register_api_first_families()
+
+
+def dispatch_api_first_family_extract(
+    family: str,
+    session: requests.Session,
+    listing_url: str,
+    site: dict,
+    *,
+    api_x_domain: str = "",
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    """
+    Ponto único para futuras famílias API-first. Hoje só ``gerenciarimoveis_cf``
+    (requer ``api_x_domain`` do probe).
+    """
+    if family == PLATFORM_FAMILY_GERENCIAR_IMOVEIS_CF:
+        return extract_imoveis_gerenciar_imoveis_cf_api(
+            session, listing_url, site, api_x_domain=api_x_domain
+        )
+    return None
+
+
 def detect_sistema(html: str, url: str) -> str:
     """Detecta qual sistema imobiliário o site usa."""
     signals = {
@@ -1751,6 +2395,8 @@ Retorne APENAS o JSON do array, sem texto adicional."""
             log.warning(f"IA normalização falhou: {e}. Usando dados brutos.")
             normalized.extend(batch)
 
+    for im in normalized:
+        ensure_imovel_preco_fields(im)
     return normalized
 
 
@@ -1912,11 +2558,301 @@ def finalize_data_quality_summary(summary: SiteRunSummary, site_name: str) -> No
     log.info("[auditoria dados] %s — %s", site_name, summary.data_quality_summary)
 
 
-def upsert_imoveis(conn, imoveis: list[dict], site_id: int) -> dict:
-    """Salva imóveis no banco com lógica de novo / atualizado / sem mudança.
+# --- Ciclo de vida (``upsert_imoveis`` / coluna ``imovel_historico.status``) ---
+LS_NEW = "NEW"
+LS_REAPPEARED = "REAPPEARED"
+LS_PRICE_CHANGE = "PRICE_CHANGE"
+LS_CONTENT_CHANGE = "CONTENT_CHANGE"
+LS_UNCHANGED = "UNCHANGED"
+LS_REMOVED = "REMOVED"
 
-    MINI-ETAPA 5A: coluna ``hash`` recebe a chave estável; migração automática se o registro
-    antigo ainda usa o hash legado (url+título+preço).
+# Mapa compartilhado em um mesmo ``scrape_site``: (imovel_id, run_key) -> (row_id, último status gravado).
+# ``run_key`` é ``run_id`` quando definido, senão ``"__none__"`` (um slot por imóvel por execução do site).
+ImovelHistoricoDedupeMap = dict[tuple[int, int | str], tuple[int, str]]
+
+
+def _imovel_historico_dedupe_key(imovel_id: int, run_id: int | None) -> tuple[int, int | str]:
+    return (imovel_id, run_id if run_id is not None else "__none__")
+
+
+def _merge_imovel_historico_status(previous: str, incoming: str) -> str:
+    """Preserva o status ``mais informativo`` quando o mesmo imóvel é tocado várias vezes no mesmo run."""
+    rank = {
+        LS_UNCHANGED: 0,
+        LS_NEW: 1,
+        LS_CONTENT_CHANGE: 2,
+        LS_PRICE_CHANGE: 3,
+        LS_REAPPEARED: 4,
+        LS_REMOVED: 5,
+    }
+    rp = rank.get(previous, 0)
+    ri = rank.get(incoming, 0)
+    return previous if rp >= ri else incoming
+
+
+def record_imovel_historico_for_run(
+    conn: sqlite3.Connection,
+    imovel_id: int,
+    run_id: int | None,
+    preco: Any,
+    content_hash: str,
+    status: str,
+    *,
+    dedupe: ImovelHistoricoDedupeMap | None = None,
+) -> None:
+    """
+    Grava uma linha em ``imovel_historico`` (imovel_id, run_id, preco, content_hash, status).
+
+    Com ``dedupe`` (mesmo dict em todas as chamadas dentro de um ``scrape_site``), garante no máximo
+    **uma** linha por imóvel por execução: se o mesmo ``imovel_id`` aparecer de novo (ex.: várias
+    páginas), faz ``UPDATE`` da linha já inserida para refletir o estado final do run.
+
+    Sem ``dedupe``, cada chamada faz ``INSERT`` (pode duplicar entre páginas).
+
+    Status esperados: NEW, UNCHANGED, PRICE_CHANGE, CONTENT_CHANGE, REAPPEARED, REMOVED.
+
+    Exemplo real (``run_id=42``, listagem em 2 páginas, mesmo ``imovel_id=100``):
+
+    1. Página 1 — primeiro upsert: ``INSERT`` com ``status='NEW'``, ``preco=450000``,
+       ``content_hash=build_hash(im)`` (MD5 do JSON ordenado preço/área/quartos/cidade/bairro).
+    2. Página 2 — segundo upsert (mesmo anúncio de novo na listagem): ``UPDATE`` da mesma linha
+       com ``preco=450000``, ``status='UNCHANGED'`` não rebaixa o rótulo: permanece ``NEW``;
+       se o preço mudasse entre páginas, ``PRICE_CHANGE`` prevalece sobre ``NEW``/``UNCHANGED``.
+    3. Fim do site — remoção entre runs: ``UPDATE`` ou novo ``INSERT`` para outro ``imovel_id``
+       com ``status='REMOVED'`` (usa o mesmo ``dedupe`` para não duplicar REMOVED no mesmo run).
+    """
+    key = _imovel_historico_dedupe_key(imovel_id, run_id)
+    if dedupe is not None and key in dedupe:
+        hid, prev_st = dedupe[key]
+        merged = _merge_imovel_historico_status(prev_st, status)
+        conn.execute(
+            """
+            UPDATE imovel_historico
+            SET run_id = ?, preco = ?, content_hash = ?, status = ?
+            WHERE id = ?
+            """,
+            (run_id, preco, content_hash, merged, hid),
+        )
+        dedupe[key] = (hid, merged)
+        return
+    cur = conn.execute(
+        """
+        INSERT INTO imovel_historico (imovel_id, run_id, preco, content_hash, status)
+        VALUES (?,?,?,?,?)
+        """,
+        (imovel_id, run_id, preco, content_hash, status),
+    )
+    if dedupe is not None:
+        dedupe[key] = (int(cur.lastrowid), status)
+
+
+def build_hash(record: dict) -> str:
+    """
+    Hash de **conteúdo relevante** para ``CONTENT_CHANGE`` (ignora ruído de HTML / texto livre).
+
+    Payload JSON com chaves fixas (ordenadas na serialização): ``preco``, ``area``, ``quartos``,
+    ``cidade``, ``bairro``. Preço via ``preco_numeric`` / ``preco`` / ``preco_texto`` (``normalize_price``).
+    Área lê ``area_m2`` do registro (campo usado no pipeline).
+
+    **Antes (removido):** MD5 de título, descrição, URLs, tipo, código, banheiros, vagas, etc. —
+    qualquer mudança cosmética ou reordenação de cópia gerava ``CONTENT_CHANGE`` falso.
+
+    **Depois:** só mudanças em preço (canônico), área, quartos, cidade ou bairro alteram o hash.
+    Registros antigos em ``raw_json`` continuam válidos: os mesmos campos são lidos do JSON salvo.
+    """
+    preco = normalize_price(record.get("preco_numeric"))
+    if preco is None:
+        preco = normalize_price(record.get("preco"))
+    if preco is None:
+        preco = normalize_price(record.get("preco_texto"))
+    payload = {
+        "area": record.get("area_m2"),
+        "bairro": (record.get("bairro") or "").strip(),
+        "cidade": (record.get("cidade") or "").strip(),
+        "preco": preco,
+        "quartos": record.get("quartos"),
+    }
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.md5(canonical.encode("utf-8")).hexdigest()
+
+
+def _content_hash_from_raw_json(raw: str | None) -> str | None:
+    """Recalcula ``build_hash`` a partir de ``raw_json`` persistido (compatível com dumps antigos)."""
+    if not raw or not str(raw).strip():
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return build_hash(data)
+
+
+def _preco_mudou_numeric(
+    preco_num_ant: float | None, preco_num_novo: float | None
+) -> bool:
+    """Comparação de preço sempre em valores numéricos canônicos (``preco_numeric``)."""
+    if preco_num_ant is None and preco_num_novo is None:
+        return False
+    if preco_num_ant is None or preco_num_novo is None:
+        return True
+    return not math.isclose(
+        float(preco_num_ant), float(preco_num_novo), rel_tol=0.0, abs_tol=0.01
+    )
+
+
+def _classificar_status_ciclo(
+    *, estava_inativo: bool, preco_changed: bool, conteudo_changed: bool
+) -> str:
+    if estava_inativo:
+        return LS_REAPPEARED
+    if preco_changed:
+        return LS_PRICE_CHANGE
+    if conteudo_changed:
+        return LS_CONTENT_CHANGE
+    return LS_UNCHANGED
+
+
+def _fetch_existente_imovel(
+    conn: sqlite3.Connection,
+    site_id: int,
+    candidates: list[str],
+    canonical_url: str | None,
+) -> tuple[Any, ...] | None:
+    ph = ",".join("?" * len(candidates))
+    row = conn.execute(
+        f"""
+        SELECT id, preco, preco_texto, preco_numeric, hash, ativo, COALESCE(total_coletas, 0), raw_json,
+               reappeared_at, removed_at
+        FROM imoveis
+        WHERE site_id=? AND hash IN ({ph})
+        """,
+        (site_id, *candidates),
+    ).fetchone()
+    if row:
+        return row
+    if canonical_url:
+        row = conn.execute(
+            """
+            SELECT id, preco, preco_texto, preco_numeric, hash, ativo, COALESCE(total_coletas, 0), raw_json,
+                   reappeared_at, removed_at
+            FROM imoveis
+            WHERE site_id=? AND canonical_url_anuncio=?
+            LIMIT 1
+            """,
+            (site_id, canonical_url),
+        ).fetchone()
+    return row
+
+
+def _insert_novo_imovel_row(
+    conn: sqlite3.Connection,
+    *,
+    h: str,
+    im: dict,
+    src: str,
+    canon: str | None,
+    ifb: int,
+    leg_col: Any,
+    iqual: Any,
+    iq_reason: Any,
+    dqs: Any,
+    dql: Any,
+    dqij: str,
+    agora: str,
+) -> int | None:
+    """Retorna ``lastrowid`` ou ``None`` se houver colisão de unicidade (hash ou URL canônica)."""
+    raw_dump = json.dumps(im, ensure_ascii=False)
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO imoveis
+            (hash, site_id, site_name, titulo, tipo, finalidade, preco, preco_texto, preco_numeric,
+             area_m2, quartos, banheiros, vagas, bairro, cidade, endereco, descricao,
+             url_anuncio, url_foto, codigo, identity_source, legacy_hash, canonical_url_anuncio,
+             identity_fallback, identity_quality, identity_quality_reason,
+             data_quality_score, data_quality_level, data_quality_issues,
+             ativo, primeira_vez, ultima_vez, primeira_coleta, ultima_coleta, total_coletas,
+             removed_at, reappeared_at, raw_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,1,NULL,NULL,?)
+            """,
+            (
+                h,
+                im.get("site_id"),
+                im.get("site_name"),
+                im.get("titulo"),
+                im.get("tipo"),
+                im.get("finalidade", "venda"),
+                im.get("preco"),
+                im.get("preco_texto"),
+                im.get("preco_numeric"),
+                im.get("area_m2"),
+                im.get("quartos"),
+                im.get("banheiros"),
+                im.get("vagas"),
+                im.get("bairro"),
+                im.get("cidade", "Jaraguá do Sul"),
+                im.get("endereco"),
+                im.get("descricao"),
+                im.get("url_anuncio"),
+                im.get("url_foto"),
+                im.get("codigo"),
+                src,
+                leg_col,
+                canon,
+                ifb,
+                iqual,
+                iq_reason,
+                dqs,
+                dql,
+                dqij,
+                agora,
+                agora,
+                agora,
+                agora,
+                raw_dump,
+            ),
+        )
+        return int(cur.lastrowid)
+    except sqlite3.IntegrityError:
+        return None
+
+
+def upsert_imoveis(
+    conn: sqlite3.Connection,
+    imoveis: list[dict],
+    site_id: int,
+    run_id: int | None = None,
+    *,
+    historico_dedupe: ImovelHistoricoDedupeMap | None = None,
+) -> dict:
+    """Salva imóveis com identidade estável, anti-duplicata por hash e URL canônica, e ciclo de vida.
+
+    MINI-ETAPA 5A: coluna ``hash`` estável; migração automática a partir do hash legado.
+
+    **Resolução de registro:** (1) ``hash`` estável ou legado; (2) se não achar e houver
+    ``canonical_url_anuncio``, o mesmo par ``(site_id, canonical)`` (índice único parcial,
+    quando existir). **Inserção:** ``INSERT``; colisão de unicidade dispara nova busca e
+    atualização do registro existente (equivalente a ``ON CONFLICT`` sem duplicar linha).
+
+    **Cenários (``imovel_historico.status``):**
+
+    - **NEW:** primeira linha do imóvel; ``primeira_coleta`` / ``ultima_coleta`` = agora,
+      ``total_coletas`` = 1, ``ativo`` = 1.
+    - **REAPPEARED:** registro existia com ``ativo`` = 0; volta a 1, ``reappeared_at`` = agora,
+      ``removed_at`` = NULL; ``total_coletas`` incrementa.
+    - **PRICE_CHANGE:** já ativo, preço alterado (``historico_precos`` também recebe linha).
+    - **CONTENT_CHANGE:** já ativo, preço igual, mas ``build_hash`` (preco/area/quartos/cidade/bairro)
+      diferente do ``raw_json`` anterior.
+    - **UNCHANGED:** já ativo, preço e conteúdo iguais; ainda assim ``ultima_coleta`` e
+      ``total_coletas`` avançam (cada coleta conta).
+
+    Parâmetro opcional ``run_id``: id em ``scheduled_runs`` (ou outro) para correlacionar
+    eventos em ``imovel_historico``.
+
+    ``historico_dedupe``: mapa mutável por execução do site (ver ``record_imovel_historico_for_run``);
+    sem ele, listagens paginadas podem gerar várias linhas de histórico para o mesmo imóvel no mesmo run.
     """
     agora = datetime.now().isoformat()
     stats = {
@@ -1929,12 +2865,20 @@ def upsert_imoveis(conn, imoveis: list[dict], site_id: int) -> dict:
         "data_quality_counts": {"HIGH": 0, "MEDIUM": 0, "LOW": 0},
         "data_quality_flags": {"missing_price": 0, "missing_location": 0},
         "data_quality_score_sum": 0.0,
+        "lifecycle": {
+            LS_NEW: 0,
+            LS_REAPPEARED: 0,
+            LS_PRICE_CHANGE: 0,
+            LS_CONTENT_CHANGE: 0,
+            LS_UNCHANGED: 0,
+        },
     }
 
     for im in imoveis:
         if not im.get("titulo"):
             continue
         id_res = apply_property_identity(im)
+        ensure_imovel_preco_fields(im)
         evaluate_field_quality(im)
         h = im["hash"]
         src = id_res.identity_source
@@ -1965,13 +2909,11 @@ def upsert_imoveis(conn, imoveis: list[dict], site_id: int) -> dict:
         candidates = [h]
         if leg != h:
             candidates.append(leg)
-        ph = ",".join("?" * len(candidates))
-        existente = conn.execute(
-            f"SELECT id, preco, preco_texto, hash FROM imoveis WHERE site_id=? AND hash IN ({ph})",
-            (site_id, *candidates),
-        ).fetchone()
-
         canon = id_res.canonical_url_anuncio or None
+        if canon:
+            canon = canon.strip() or None
+
+        existente = _fetch_existente_imovel(conn, site_id, candidates, canon)
         ifb = 1 if id_res.identity_fallback else 0
         leg_col = im.get("legacy_hash")
         iqual = im.get("identity_quality")
@@ -1979,123 +2921,302 @@ def upsert_imoveis(conn, imoveis: list[dict], site_id: int) -> dict:
         dqs = im.get("data_quality_score")
         dql = im.get("data_quality_level")
         dqij = data_quality_issues_json(im)
+        raw_dump = json.dumps(im, ensure_ascii=False)
+        fp_novo = build_hash(im)
 
         if existente is None:
-            cur = conn.execute(
-                """
-                INSERT INTO imoveis
-                (hash, site_id, site_name, titulo, tipo, finalidade, preco, preco_texto,
-                 area_m2, quartos, banheiros, vagas, bairro, cidade, endereco, descricao,
-                 url_anuncio, url_foto, codigo, identity_source, legacy_hash, canonical_url_anuncio,
-                 identity_fallback, identity_quality, identity_quality_reason,
-                 data_quality_score, data_quality_level, data_quality_issues,
-                 ativo, primeira_vez, ultima_vez, raw_json)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)
-                """,
-                (
-                    h,
-                    im.get("site_id"),
-                    im.get("site_name"),
-                    im.get("titulo"),
-                    im.get("tipo"),
-                    im.get("finalidade", "venda"),
-                    im.get("preco"),
-                    im.get("preco_texto"),
-                    im.get("area_m2"),
-                    im.get("quartos"),
-                    im.get("banheiros"),
-                    im.get("vagas"),
-                    im.get("bairro"),
-                    im.get("cidade", "Jaraguá do Sul"),
-                    im.get("endereco"),
-                    im.get("descricao"),
-                    im.get("url_anuncio"),
-                    im.get("url_foto"),
-                    im.get("codigo"),
-                    src,
-                    leg_col,
-                    canon,
-                    ifb,
-                    iqual,
-                    iq_reason,
-                    dqs,
-                    dql,
-                    dqij,
-                    agora,
-                    agora,
-                    json.dumps(im, ensure_ascii=False),
-                ),
+            novo_id = _insert_novo_imovel_row(
+                conn,
+                h=h,
+                im=im,
+                src=src,
+                canon=canon,
+                ifb=ifb,
+                leg_col=leg_col,
+                iqual=iqual,
+                iq_reason=iq_reason,
+                dqs=dqs,
+                dql=dql,
+                dqij=dqij,
+                agora=agora,
             )
-            imovel_id = cur.lastrowid
-            if im.get("preco"):
-                conn.execute(
-                    "INSERT INTO historico_precos (imovel_id, preco, preco_texto, data) VALUES (?,?,?,?)",
-                    (imovel_id, im["preco"], im.get("preco_texto"), agora),
-                )
-            stats["novos"] += 1
-        else:
-            imovel_id, preco_ant, _, hash_antigo = existente
-            if hash_antigo != h:
-                conn.execute(
-                    """
-                    UPDATE imoveis SET hash=?, identity_source=?, legacy_hash=?, canonical_url_anuncio=?,
-                    identity_fallback=?, identity_quality=?, identity_quality_reason=?,
-                    data_quality_score=?, data_quality_level=?, data_quality_issues=? WHERE id=?
-                    """,
-                    (h, src, hash_antigo, canon, ifb, iqual, iq_reason, dqs, dql, dqij, imovel_id),
-                )
-                stats["identity_migrated"] += 1
-                log.debug(
-                    "Identidade migrada: imovel_id=%s hash_antigo=%s… -> hash_novo=%s… fonte=%s",
+            if novo_id is None:
+                existente = _fetch_existente_imovel(conn, site_id, candidates, canon)
+            else:
+                imovel_id = novo_id
+                if im.get("preco_numeric") is not None:
+                    conn.execute(
+                        "INSERT INTO historico_precos (imovel_id, preco, preco_texto, data) VALUES (?,?,?,?)",
+                        (imovel_id, im["preco_numeric"], im.get("preco_texto"), agora),
+                    )
+                record_imovel_historico_for_run(
+                    conn,
                     imovel_id,
-                    hash_antigo[:12],
-                    h[:12],
-                    src,
+                    run_id,
+                    im.get("preco_numeric"),
+                    fp_novo,
+                    LS_NEW,
+                    dedupe=historico_dedupe,
                 )
+                stats["novos"] += 1
+                stats["lifecycle"][LS_NEW] += 1
+                continue
 
+        if existente is None:
+            log.error(
+                "upsert_imoveis: IntegrityError sem registro resolvido (site_id=%s hash=%s…)",
+                site_id,
+                h[:12],
+            )
+            continue
+
+        (
+            imovel_id,
+            preco_ant,
+            _pt_ant,
+            preco_num_ant,
+            hash_antigo,
+            ativo_ant,
+            total_ant,
+            raw_ant,
+            reappeared_ant,
+            removed_ant,
+        ) = existente
+        estava_inativo = int(ativo_ant or 0) == 0
+        total_novo = int(total_ant or 0) + 1
+        preco_changed = _preco_mudou_numeric(
+            preco_num_ant, im.get("preco_numeric")
+        )
+        fp_antigo = _content_hash_from_raw_json(raw_ant)
+        conteudo_changed = fp_antigo is not None and fp_novo != fp_antigo
+        status_ciclo = _classificar_status_ciclo(
+            estava_inativo=estava_inativo,
+            preco_changed=preco_changed,
+            conteudo_changed=conteudo_changed,
+        )
+        stats["lifecycle"][status_ciclo] += 1
+
+        if hash_antigo != h:
             conn.execute(
                 """
-                UPDATE imoveis SET ultima_vez=?, ativo=1, identity_source=?, canonical_url_anuncio=?,
+                UPDATE imoveis SET hash=?, identity_source=?, legacy_hash=?, canonical_url_anuncio=?,
                 identity_fallback=?, identity_quality=?, identity_quality_reason=?,
                 data_quality_score=?, data_quality_level=?, data_quality_issues=? WHERE id=?
                 """,
-                (agora, src, canon, ifb, iqual, iq_reason, dqs, dql, dqij, imovel_id),
+                (h, src, hash_antigo, canon, ifb, iqual, iq_reason, dqs, dql, dqij, imovel_id),
             )
-            if im.get("preco") and im["preco"] != preco_ant:
-                conn.execute(
-                    "INSERT INTO historico_precos (imovel_id, preco, preco_texto, data) VALUES (?,?,?,?)",
-                    (imovel_id, im["preco"], im.get("preco_texto"), agora),
-                )
-                conn.execute(
-                    "UPDATE imoveis SET preco=?, preco_texto=? WHERE id=?",
-                    (im["preco"], im.get("preco_texto"), imovel_id),
-                )
-                stats["atualizados"] += 1
-                log.debug(
-                    "Preço alterado; identidade mantida: imovel_id=%s fonte=%s hash=%s…",
-                    imovel_id,
-                    src,
-                    h[:12],
-                )
-            else:
-                stats["sem_mudanca"] += 1
+            stats["identity_migrated"] += 1
+            log.debug(
+                "Identidade migrada: imovel_id=%s hash_antigo=%s… -> hash_novo=%s… fonte=%s",
+                imovel_id,
+                hash_antigo[:12],
+                h[:12],
+                src,
+            )
+
+        if estava_inativo:
+            new_reappeared = agora
+            new_removed = None
+        else:
+            new_reappeared = reappeared_ant
+            new_removed = removed_ant
+
+        conn.execute(
+            """
+            UPDATE imoveis SET
+                ultima_vez=?, ultima_coleta=?, ativo=1, total_coletas=?,
+                identity_source=?, canonical_url_anuncio=?,
+                identity_fallback=?, identity_quality=?, identity_quality_reason=?,
+                data_quality_score=?, data_quality_level=?, data_quality_issues=?,
+                titulo=?, tipo=?, finalidade=?, preco=?, preco_texto=?, preco_numeric=?,
+                area_m2=?, quartos=?, banheiros=?, vagas=?, bairro=?, cidade=?, endereco=?, descricao=?,
+                url_anuncio=?, url_foto=?, codigo=?, site_name=?,
+                reappeared_at=?, removed_at=?,
+                raw_json=?
+            WHERE id=?
+            """,
+            (
+                agora,
+                agora,
+                total_novo,
+                src,
+                canon,
+                ifb,
+                iqual,
+                iq_reason,
+                dqs,
+                dql,
+                dqij,
+                im.get("titulo"),
+                im.get("tipo"),
+                im.get("finalidade", "venda"),
+                im.get("preco"),
+                im.get("preco_texto"),
+                im.get("preco_numeric"),
+                im.get("area_m2"),
+                im.get("quartos"),
+                im.get("banheiros"),
+                im.get("vagas"),
+                im.get("bairro"),
+                im.get("cidade", "Jaraguá do Sul"),
+                im.get("endereco"),
+                im.get("descricao"),
+                im.get("url_anuncio"),
+                im.get("url_foto"),
+                im.get("codigo"),
+                im.get("site_name"),
+                new_reappeared,
+                new_removed,
+                raw_dump,
+                imovel_id,
+            ),
+        )
+
+        if preco_changed and im.get("preco_numeric") is not None:
+            conn.execute(
+                "INSERT INTO historico_precos (imovel_id, preco, preco_texto, data) VALUES (?,?,?,?)",
+                (imovel_id, im["preco_numeric"], im.get("preco_texto"), agora),
+            )
+            log.debug(
+                "Preço alterado; imovel_id=%s fonte=%s hash=%s…",
+                imovel_id,
+                src,
+                h[:12],
+            )
+
+        record_imovel_historico_for_run(
+            conn,
+            imovel_id,
+            run_id,
+            im.get("preco_numeric"),
+            fp_novo,
+            status_ciclo,
+            dedupe=historico_dedupe,
+        )
+
+        if status_ciclo == LS_UNCHANGED:
+            stats["sem_mudanca"] += 1
+        else:
+            stats["atualizados"] += 1
 
     conn.commit()
     return stats
 
 
+def _load_site_listing_keys_snapshot(conn: sqlite3.Connection, site_id: int) -> set[str]:
+    """Conjunto de ``hash`` vistos no último run **válido** gravado em ``site_listing_snapshots``."""
+    row = conn.execute(
+        "SELECT listing_keys_json FROM site_listing_snapshots WHERE site_id=?",
+        (site_id,),
+    ).fetchone()
+    if not row or not row[0]:
+        return set()
+    try:
+        data = json.loads(row[0])
+    except (json.JSONDecodeError, TypeError):
+        return set()
+    if not isinstance(data, list):
+        return set()
+    return {str(x) for x in data if x}
+
+
+def _save_site_listing_keys_snapshot(
+    conn: sqlite3.Connection, site_id: int, keys: set[str], agora: str
+) -> None:
+    payload = json.dumps(sorted(keys), ensure_ascii=False)
+    conn.execute(
+        """
+        INSERT INTO site_listing_snapshots (site_id, listing_keys_json, updated_at)
+        VALUES (?,?,?)
+        ON CONFLICT(site_id) DO UPDATE SET
+            listing_keys_json = excluded.listing_keys_json,
+            updated_at = excluded.updated_at
+        """,
+        (site_id, payload, agora),
+    )
+
+
+def _cross_run_removal_looks_suspicious(previous_keys: set[str], current_keys: set[str]) -> tuple[bool, str]:
+    """
+    Evita marcar REMOVED em massa quando a listagem atual parece incompleta (OK falso).
+    Só aplica quando já há histórico suficiente no snapshot anterior.
+    """
+    pn = len(previous_keys)
+    cn = len(current_keys)
+    if pn < REMOVALS_PREVIOUS_KEYS_MIN_FOR_RATIO:
+        return False, ""
+    min_expected = max(3, int(pn * REMOVALS_CURRENT_VS_PREVIOUS_MIN_RATIO))
+    if cn < min_expected:
+        return (
+            True,
+            f"listagem atual ({cn} chaves) < {REMOVALS_CURRENT_VS_PREVIOUS_MIN_RATIO:.0%} "
+            f"do snapshot anterior ({pn}); possível coleta incompleta",
+        )
+    return False, ""
+
+
+def _apply_market_removals_for_hashes(
+    conn: sqlite3.Connection,
+    site_id: int,
+    missing_hashes: set[str],
+    agora: str,
+    run_id: int | None,
+    *,
+    historico_dedupe: ImovelHistoricoDedupeMap | None = None,
+) -> int:
+    """
+    Para cada hash em ``missing_hashes``: ``ativo=0``, ``removed_at``, linha em
+    ``imovel_historico`` com ``status=REMOVED``. Não apaga linhas.
+    """
+    applied = 0
+    for h in missing_hashes:
+        row = conn.execute(
+            "SELECT id, preco, preco_numeric, ativo FROM imoveis WHERE site_id=? AND hash=?",
+            (site_id, h),
+        ).fetchone()
+        if not row:
+            log.warning(
+                "Remoção entre runs: hash %s… não existe para site_id=%s (snapshot órfão; ignorado)",
+                h[:16],
+                site_id,
+            )
+            continue
+        imovel_id, preco, preco_num, ativo = int(row[0]), row[1], row[2], int(row[3] or 0)
+        if ativo == 0:
+            continue
+        conn.execute(
+            "UPDATE imoveis SET ativo=0, ultima_vez=?, removed_at=? WHERE id=?",
+            (agora, agora, imovel_id),
+        )
+        p_hist = preco_num if preco_num is not None else normalize_price(preco)
+        record_imovel_historico_for_run(
+            conn,
+            imovel_id,
+            run_id,
+            p_hist,
+            h,
+            LS_REMOVED,
+            dedupe=historico_dedupe,
+        )
+        applied += 1
+    return applied
+
+
 def marcar_removidos(conn, site_id: int, hashes_vistos: set) -> int:
-    """Marca como inativos imóveis do site que não apareceram nessa rodada."""
+    """
+    Legado / uso pontual: inativa **todos** os ativos do site que não estão em ``hashes_vistos``.
+    O fluxo principal do scraper usa ``apply_site_removals_with_guard`` (snapshot run anterior × atual).
+    """
+    agora = datetime.now().isoformat()
     ativos = conn.execute(
         "SELECT id, hash FROM imoveis WHERE site_id=? AND ativo=1", (site_id,)
     ).fetchall()
     removidos = 0
-    agora = datetime.now().isoformat()
     for row in ativos:
         if row[1] not in hashes_vistos:
             conn.execute(
-                "UPDATE imoveis SET ativo=0, ultima_vez=? WHERE id=?",
-                (agora, row[0])
+                "UPDATE imoveis SET ativo=0, ultima_vez=?, removed_at=? WHERE id=?",
+                (agora, agora, row[0]),
             )
             removidos += 1
     conn.commit()
@@ -2103,11 +3224,11 @@ def marcar_removidos(conn, site_id: int, hashes_vistos: set) -> int:
 
 
 def contar_removidos_pendentes(conn, site_id: int, hashes_vistos: set) -> int:
-    """Quantos ativos do site não estão em ``hashes_vistos`` (seriam inativados por ``marcar_removidos``)."""
-    rows = conn.execute(
-        "SELECT hash FROM imoveis WHERE site_id=? AND ativo=1", (site_id,)
-    ).fetchall()
-    return sum(1 for row in rows if row[0] not in hashes_vistos)
+    """Quantos seriam marcados como REMOVED pela política entre runs (snapshot − atual), sem olhar só o DB."""
+    prev = _load_site_listing_keys_snapshot(conn, site_id)
+    if not prev:
+        return 0
+    return len(prev - set(hashes_vistos))
 
 
 def apply_site_removals_with_guard(
@@ -2116,38 +3237,101 @@ def apply_site_removals_with_guard(
     hashes_vistos: set,
     extraction: SiteExtractionStatus,
     volume_total: int,
+    run_id: int | None = None,
+    *,
+    historico_dedupe: ImovelHistoricoDedupeMap | None = None,
 ) -> dict[str, int | bool | str]:
     """
-    Aplica ``marcar_removidos`` só quando ``removals_safe`` (derivado de status + volume).
-    Retorna campos para ``stats``/``SiteRunSummary``.
+    Compara chaves do **run anterior** (snapshot) com o **run atual**; só então marca REMOVED.
+
+    - ``missing = previous_keys - current_keys`` → saíram do mercado desde o último run válido.
+    - Só executa com ``removals_safe`` (``compute_sync_removals_safe``: status OK, volume > 0).
+    - Trava extra se a listagem atual for muito menor que o snapshot (queda brusca).
+    - Após aplicar remoções, grava ``current_keys`` como novo snapshot (run válido).
+    - Em falha de scraping / run inválido: não altera snapshot nem marca removidos.
     """
     _, removals_safe = compute_sync_removals_safe(extraction, volume_total)
     site_name = site["name"]
+    site_id = site["id"]
+    agora = datetime.now().isoformat()
+    current_keys = set(hashes_vistos)
+    previous_keys = _load_site_listing_keys_snapshot(conn, site_id)
+    missing = previous_keys - current_keys
+    n_prev, n_cur = len(previous_keys), len(current_keys)
 
-    if removals_safe:
-        applied = marcar_removidos(conn, site["id"], hashes_vistos)
-        log.info("Remoções permitidas para %s", site_name)
+    base_out: dict[str, int | bool | str] = {
+        "removals_previous_keys": n_prev,
+        "removals_current_keys": n_cur,
+    }
+
+    if not removals_safe:
+        log.info(
+            "Remoções entre runs bloqueadas para %s: run inválido (status=%s volume=%s). "
+            "Snapshot anterior (%d chaves) não atualizado; nada marcado como REMOVED.",
+            site_name,
+            extraction.value,
+            volume_total,
+            n_prev,
+        )
         return {
-            "removidos": applied,
-            "removals_blocked": False,
-            "removals_blocked_reason": "",
-            "removed_count_attempted": applied,
-            "removed_count_applied": applied,
+            **base_out,
+            "removidos": 0,
+            "removals_blocked": True,
+            "removals_blocked_reason": extraction.value,
+            "removed_count_attempted": len(missing),
+            "removed_count_applied": 0,
         }
 
-    reason = extraction.value
-    attempted = contar_removidos_pendentes(conn, site["id"], hashes_vistos)
-    log.info(
-        "Remoções bloqueadas para %s por status %s",
-        site_name,
-        reason,
+    suspicious, susp_reason = _cross_run_removal_looks_suspicious(previous_keys, current_keys)
+    if suspicious:
+        log.warning(
+            "Remoções entre runs bloqueadas para %s: %s "
+            "(anterior=%d chaves, atual=%d; snapshot não atualizado).",
+            site_name,
+            susp_reason,
+            n_prev,
+            n_cur,
+        )
+        return {
+            **base_out,
+            "removidos": 0,
+            "removals_blocked": True,
+            "removals_blocked_reason": susp_reason,
+            "removed_count_attempted": len(missing),
+            "removed_count_applied": 0,
+        }
+
+    applied = _apply_market_removals_for_hashes(
+        conn, site_id, missing, agora, run_id, historico_dedupe=historico_dedupe
     )
+    _save_site_listing_keys_snapshot(conn, site_id, current_keys, agora)
+    conn.commit()
+
+    if missing:
+        log.info(
+            "Remoções entre runs em %s: ausentes=%d (snapshot anterior=%d -> atual=%d) "
+            "-> imoveis marcados inativos + historico REMOVED=%d; snapshot gravado.",
+            site_name,
+            len(missing),
+            n_prev,
+            n_cur,
+            applied,
+        )
+    else:
+        log.info(
+            "Remoções entre runs em %s: nenhuma chave ausente (anterior=%d atual=%d); snapshot atualizado.",
+            site_name,
+            n_prev,
+            n_cur,
+        )
+
     return {
-        "removidos": 0,
-        "removals_blocked": True,
-        "removals_blocked_reason": reason,
-        "removed_count_attempted": attempted,
-        "removed_count_applied": 0,
+        **base_out,
+        "removidos": applied,
+        "removals_blocked": False,
+        "removals_blocked_reason": "",
+        "removed_count_attempted": len(missing),
+        "removed_count_applied": applied,
     }
 
 
@@ -2369,7 +3553,14 @@ def _log_pagination_guard_failure(site_name: str, guard, target_page: int) -> No
         )
 
 
-def scrape_site(site: dict, conn, session, *, retry_context: dict | None = None) -> dict:
+def scrape_site(
+    site: dict,
+    conn,
+    session,
+    *,
+    retry_context: dict | None = None,
+    run_id: int | None = None,
+) -> dict:
     """Scrapa todas as páginas de um site e salva no banco. Retorna stats + extraction_status + site_summary."""
     log.info(f"[{site['id']:2d}/53] {site['name']}")
     t_mono = time.monotonic()
@@ -2377,6 +3568,7 @@ def scrape_site(site: dict, conn, session, *, retry_context: dict | None = None)
     agora = started
     stats = {"novos": 0, "atualizados": 0, "sem_mudanca": 0, "removidos": 0, "total": 0}
     hashes_vistos = set()
+    historico_dedupe: ImovelHistoricoDedupeMap = {}
 
     summary = SiteRunSummary(
         site=site["name"],
@@ -2423,7 +3615,13 @@ def scrape_site(site: dict, conn, session, *, retry_context: dict | None = None)
 
             if imoveis_todos:
                 imoveis_todos = normalizar_com_ia(imoveis_todos)
-                page_stats = upsert_imoveis(conn, imoveis_todos, site["id"])
+                page_stats = upsert_imoveis(
+                    conn,
+                    imoveis_todos,
+                    site["id"],
+                    run_id=run_id,
+                    historico_dedupe=historico_dedupe,
+                )
                 _merge_identity_stats(summary, page_stats)
                 _merge_data_quality_stats(summary, page_stats)
                 for k in ["novos", "atualizados", "sem_mudanca"]:
@@ -2470,12 +3668,22 @@ def scrape_site(site: dict, conn, session, *, retry_context: dict | None = None)
                     False,
                 )
 
-            rm = apply_site_removals_with_guard(conn, site, hashes_vistos, extraction, vol)
+            rm = apply_site_removals_with_guard(
+                conn,
+                site,
+                hashes_vistos,
+                extraction,
+                vol,
+                run_id=run_id,
+                historico_dedupe=historico_dedupe,
+            )
             stats["removidos"] = rm["removidos"]
             stats["removals_blocked"] = rm["removals_blocked"]
             stats["removals_blocked_reason"] = rm["removals_blocked_reason"]
             stats["removed_count_attempted"] = rm["removed_count_attempted"]
             stats["removed_count_applied"] = rm["removed_count_applied"]
+            stats["removals_previous_keys"] = rm["removals_previous_keys"]
+            stats["removals_current_keys"] = rm["removals_current_keys"]
 
             summary.seal(t_mono)
             _persist_site_log(
@@ -2557,7 +3765,59 @@ def scrape_site(site: dict, conn, session, *, retry_context: dict | None = None)
                 )
                 break
 
-            imoveis_pagina = extract_imoveis_generic(html, url_final, site)
+            used_gerenciar_cf_api = False
+            imoveis_pagina: list[dict[str, Any]] = []
+            if page_num == 1:
+                plat_fam, fam_diag = detect_platform_family(url_final, html, session)
+                if fam_diag.get("gerenciar_cf_api_probe_used"):
+                    summary.gerenciar_cf_api_probe_used = True
+                    summary.gerenciar_cf_api_probe_status = str(
+                        fam_diag.get("probe_status") or ""
+                    )
+                if plat_fam != PLATFORM_FAMILY_GENERIC:
+                    summary.platform_family_detected = plat_fam
+                if plat_fam == PLATFORM_FAMILY_GERENCIAR_IMOVEIS_CF:
+                    x_host = str(fam_diag.get("x_domain_host_used") or "")
+                    _pair = dispatch_api_first_family_extract(
+                        PLATFORM_FAMILY_GERENCIAR_IMOVEIS_CF,
+                        session,
+                        url_final,
+                        site,
+                        api_x_domain=x_host,
+                    )
+                    imoveis_pagina, api_meta = (
+                        _pair if _pair is not None else ([], {"validation_reason": "dispatch_returned_none"})
+                    )
+                    used_gerenciar_cf_api = True
+                    summary.family_specific_extractor_used = True
+                    summary.family_card_count = int(api_meta.get("total_items") or 0)
+                    summary.family_detail_links_count = int(api_meta.get("detail_links") or 0)
+                    summary.family_pagination_pattern_detected = str(
+                        api_meta.get("pagination_pattern") or ""
+                    )
+                    summary.family_listing_validation_reason = str(
+                        api_meta.get("validation_reason") or ""
+                    )
+                    summary.gerenciar_cf_api_host_used = str(
+                        api_meta.get("x_domain_api_header") or x_host
+                    )
+                    summary.gerenciar_cf_api_pages_fetched = int(
+                        api_meta.get("pages_fetched") or 0
+                    )
+                    summary.gerenciar_cf_api_total_items = int(
+                        api_meta.get("total_items") or 0
+                    )
+                    summary.gerenciar_cf_api_stop_reason = str(
+                        api_meta.get("stop_reason") or ""
+                    )
+                    summary.notes.append(
+                        json.dumps(
+                            {"gerenciar_cf_api": api_meta, "family_detection": fam_diag},
+                            ensure_ascii=False,
+                        )
+                    )
+            if not used_gerenciar_cf_api:
+                imoveis_pagina = extract_imoveis_generic(html, url_final, site)
 
             if not imoveis_pagina:
                 if page_num > 1 and prev_deduped_count >= PAGINATION_FULL_PAGE_MIN and prev_had_more:
@@ -2567,7 +3827,8 @@ def scrape_site(site: dict, conn, session, *, retry_context: dict | None = None)
                     )
                 elif page_num == 1:
                     page1_bruto_zero = True
-                    if html_sugere_listagem(html):
+                    # Shell Next.js “parece” listagem no HTML mas a extração é via API nesta família.
+                    if html_sugere_listagem(html) and not used_gerenciar_cf_api:
                         listagem_invalida = True
                 log.info(f"    Página {page_num}: 0 imóveis — parando paginação")
                 break
@@ -2618,7 +3879,13 @@ def scrape_site(site: dict, conn, session, *, retry_context: dict | None = None)
 
             imoveis_pagina = normalizar_com_ia(imoveis_pagina)
 
-            page_stats = upsert_imoveis(conn, imoveis_pagina, site["id"])
+            page_stats = upsert_imoveis(
+                conn,
+                imoveis_pagina,
+                site["id"],
+                run_id=run_id,
+                historico_dedupe=historico_dedupe,
+            )
             _merge_identity_stats(summary, page_stats)
             _merge_data_quality_stats(summary, page_stats)
             for k in ["novos", "atualizados", "sem_mudanca"]:
@@ -2636,6 +3903,14 @@ def scrape_site(site: dict, conn, session, *, retry_context: dict | None = None)
             summary.last_page_omitted_items = dup_n
             summary.typical_page_volume = round(typical_vol, 2)
             summary.pages_low_yield_count = cutoff_rs.pages_low_yield_count
+
+            if used_gerenciar_cf_api:
+                log.info(
+                    "    %s: listagem completa via API (família gerenciarimoveis_cf); "
+                    "paginação HTML ignorada.",
+                    site["name"],
+                )
+                break
 
             cutoff_decision = should_stop_pagination(
                 n_bruto=n_bruto,
@@ -2721,13 +3996,21 @@ def scrape_site(site: dict, conn, session, *, retry_context: dict | None = None)
         )
 
         rm = apply_site_removals_with_guard(
-            conn, site, hashes_vistos, extraction, stats["total"]
+            conn,
+            site,
+            hashes_vistos,
+            extraction,
+            stats["total"],
+            run_id=run_id,
+            historico_dedupe=historico_dedupe,
         )
         stats["removidos"] = rm["removidos"]
         stats["removals_blocked"] = rm["removals_blocked"]
         stats["removals_blocked_reason"] = rm["removals_blocked_reason"]
         stats["removed_count_attempted"] = rm["removed_count_attempted"]
         stats["removed_count_applied"] = rm["removed_count_applied"]
+        stats["removals_previous_keys"] = rm["removals_previous_keys"]
+        stats["removals_current_keys"] = rm["removals_current_keys"]
 
         summary.seal(t_mono)
         _persist_site_log(
@@ -2792,6 +4075,7 @@ def _sqlite_row_to_supabase(row, columns: list) -> dict:
         "identity_quality",
         "identity_source",
         "identity_fallback",
+        "preco_numeric",
     ):
         d.pop(_k, None)
     return d
@@ -3462,7 +4746,7 @@ def print_round_run_report(agg: dict) -> None:
 
 def export_csv(conn, filename="imoveis_export.csv"):
     rows = conn.execute("""
-        SELECT id, site_name, titulo, tipo, preco, preco_texto,
+        SELECT id, site_name, titulo, tipo, preco, preco_numeric, preco_texto,
                area_m2, quartos, banheiros, vagas, bairro, cidade,
                url_anuncio, url_foto, ativo, primeira_vez, ultima_vez
         FROM imoveis ORDER BY primeira_vez DESC
@@ -3470,9 +4754,28 @@ def export_csv(conn, filename="imoveis_export.csv"):
 
     with open(filename, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["id","imobiliaria","titulo","tipo","preco","preco_texto",
-                         "area_m2","quartos","banheiros","vagas","bairro","cidade",
-                         "url","foto","ativo","primeira_vez","ultima_vez"])
+        writer.writerow(
+            [
+                "id",
+                "imobiliaria",
+                "titulo",
+                "tipo",
+                "preco",
+                "preco_numeric",
+                "preco_texto",
+                "area_m2",
+                "quartos",
+                "banheiros",
+                "vagas",
+                "bairro",
+                "cidade",
+                "url",
+                "foto",
+                "ativo",
+                "primeira_vez",
+                "ultima_vez",
+            ]
+        )
         writer.writerows(rows)
     print(f"✓ Exportado: {filename} ({len(rows)} imóveis)")
 

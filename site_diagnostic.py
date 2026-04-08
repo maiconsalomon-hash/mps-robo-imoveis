@@ -1,7 +1,8 @@
 """
 Status e resumo estruturado por site (MINI-ETAPA 1B + 2A) e agregado da rodada (1C + 2B).
 Classificação por site; ``removals_safe`` (com ``compute_sync_removals_safe``) é regra
-operacional para ``marcar_removidos`` no SQLite por site.
+operacional para remoções no SQLite: comparação snapshot run anterior vs. atual em
+``apply_site_removals_with_guard`` (tabela ``site_listing_snapshots``).
 MINI-ETAPA 2B: ``build_round_aggregate`` inclui ``global_sync_safe`` / ``reason``; o bloqueio do RPC
 global de remoções no Supabase quando a rodada é RISKY é aplicado em ``scraper.sync_supabase``.
 MINI-ETAPA 3A: campos ``baseline_*`` em ``SiteRunSummary`` são preenchidos em ``scraper._persist_site_log``
@@ -209,6 +210,20 @@ class SiteRunSummary:
     sync_sent_count: int = 0
     sync_filtered_count: int = 0
     sync_filter_reasons: dict[str, int] = field(default_factory=dict)
+    # Família de plataforma (ex.: API Tecimob / Gerenciar Imóveis CF + front Next.js)
+    platform_family_detected: str = ""
+    family_specific_extractor_used: bool = False
+    family_card_count: int = 0
+    family_detail_links_count: int = 0
+    family_pagination_pattern_detected: str = ""
+    family_listing_validation_reason: str = ""
+    # API Gerenciar / Tecimob (campos explícitos para operação e painéis)
+    gerenciar_cf_api_probe_used: bool = False
+    gerenciar_cf_api_probe_status: str = ""
+    gerenciar_cf_api_host_used: str = ""
+    gerenciar_cf_api_pages_fetched: int = 0
+    gerenciar_cf_api_total_items: int = 0
+    gerenciar_cf_api_stop_reason: str = ""
 
     def seal(self, started_monotonic: float | None = None) -> None:
         self.finished_at = datetime.now().isoformat()

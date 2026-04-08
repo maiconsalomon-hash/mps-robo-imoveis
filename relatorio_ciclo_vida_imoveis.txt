@@ -1,0 +1,37 @@
+========================================================================
+RELATORIO - validacao ciclo de vida (imoveis) - 2026-04-08 16:16:17
+========================================================================
+
+[1] NOVO imovel -> esperado: NEW
+    OK - imovel_id=1, status=NEW, total_coletas=1
+    Exemplo linha imoveis: {'id': 1, 'hash': '38e230c0a3ea725b433a351fd009774c', 'titulo': 'Apartamento teste LCA', 'ativo': 1, 'total_coletas': 1, 'preco': 300000.0, 'preco_numeric': 300000.0, 'preco_texto': 'R$ 300.000,00', 'bairro': 'Centro', 'cidade': 'Jaraguá do Sul', 'area_m2': 80.0, 'quartos': 2, 'removed_at': None, 'reappeared_at': None}
+
+[2] Sem mudanca -> esperado: UNCHANGED
+    OK - status=UNCHANGED, total_coletas=2
+    Historico A (amostra): id=1 run=101 st=NEW preco=300000.0 ch=1d8bc846517f...; id=2 run=102 st=UNCHANGED preco=300000.0 ch=1d8bc846517f...
+
+[3] Preco mudou -> esperado: PRICE_CHANGE
+    OK - status=PRICE_CHANGE, preco_numeric=310000.0
+
+[4] Conteudo mudou (bairro) -> esperado: CONTENT_CHANGE
+    OK - status=CONTENT_CHANGE, bairro persistido='Vila Nova'
+
+[5] Sumiu da listagem -> esperado: REMOVED em B
+    OK - B ativo=0, REMOVED no historico, removidos_aplicados=1
+    Exemplo imovel B: {'id': 2, 'hash': 'ef6801fd0cd345784700e0f663bc061a', 'titulo': 'Casa teste LCB', 'ativo': 0, 'total_coletas': 1, 'preco': 500000.0, 'preco_numeric': 500000.0, 'preco_texto': 'R$ 500.000,00', 'bairro': 'Centro', 'cidade': 'Jaraguá do Sul', 'area_m2': 80.0, 'quartos': 2, 'removed_at': '2026-04-08T16:16:17.795745', 'reappeared_at': None}
+
+[6] Voltou a listagem -> esperado: REAPPEARED em B
+    OK - status=REAPPEARED, ativo=1, removed_at=NULL
+    Historico B completo: id=5 run=105 st=NEW preco=500000.0 ch=51603edbb232...; id=6 run=105 st=REMOVED preco=500000.0 ch=ef6801fd0cd3...; id=7 run=106 st=REAPPEARED preco=500000.0 ch=51603edbb232...
+
+========================================================================
+RESUMO FINAL
+========================================================================
+  Imoveis no site 9901: 2 (esperado 2)
+  Linhas imovel_historico (site via imoveis): 
+    total eventos gravados: 7
+  Duplicata por hash: nenhuma (verificada)
+  Dados essenciais (titulo/codigos): preservados
+
+CONFIRMACAO: todos os cenarios de ciclo de vida passaram.
+========================================================================

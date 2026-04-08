@@ -132,10 +132,14 @@ def list_properties(
         where.append("LOWER(tipo) LIKE LOWER(?)")
         args.append(f"%{property_type.strip()}%")
     if min_price is not None:
-        where.append("(preco IS NOT NULL AND preco >= ?)")
+        where.append(
+            "((COALESCE(preco_numeric, preco) IS NOT NULL) AND COALESCE(preco_numeric, preco) >= ?)"
+        )
         args.append(min_price)
     if max_price is not None:
-        where.append("(preco IS NOT NULL AND preco <= ?)")
+        where.append(
+            "((COALESCE(preco_numeric, preco) IS NOT NULL) AND COALESCE(preco_numeric, preco) <= ?)"
+        )
         args.append(max_price)
 
     sql_where = " AND ".join(where)
@@ -148,7 +152,7 @@ def list_properties(
         total = int(cur.fetchone()[0])
         cur = conn.execute(
             f"""
-            SELECT id, hash, titulo, preco, preco_texto, tipo, bairro, cidade, area_m2,
+            SELECT id, hash, titulo, preco, preco_numeric, preco_texto, tipo, bairro, cidade, area_m2,
                    quartos, banheiros, vagas, url_anuncio, url_foto, site_name, site_id,
                    primeira_vez, ultima_vez, data_quality_level, identity_source
             FROM imoveis
