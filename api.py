@@ -4,6 +4,9 @@ API REST FastAPI para o app mobile Domus.
 Inicia o uvicorn e, em thread em segundo plano, o scheduler de rodadas (mesma lógica que
 ``scraper.py --scheduler``), desde que ``SCHEDULE_ENABLED=true`` e ``SCHEDULE_TIMES`` válido.
 
+Leitura de imóveis: ``GET /api/v1/properties`` usa Supabase (tabela ``properties``) como fonte
+de verdade. SQLite permanece para coleta, logs e metadados operacionais do scraper.
+
 Uso local: ``python api.py`` ou ``uvicorn api:app --host 0.0.0.0 --port 8000``
 Railway: defina ``PORT`` (a API usa ``PORT`` se existir, senão ``API_PORT``).
 """
@@ -18,12 +21,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
 
+import requests
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from config import API_HOST, API_PORT, ROBOT_API_KEY, SCHEDULE_ENABLED
+from config import (
+    API_HOST,
+    API_PORT,
+    ROBOT_API_KEY,
+    SCHEDULE_ENABLED,
+    SUPABASE_KEY,
+    SUPABASE_SYNC_ENABLED,
+    SUPABASE_TABLE,
+    SUPABASE_URL,
+)
 from scraper import DB_FILE, SITES, init_db, refresh_site_profiles, run_full_scrape_round
 from scraper_scheduler import read_scheduler_state, run_scheduler_worker
 
@@ -38,6 +51,154 @@ if not logging.getLogger().handlers:
 
 _scheduler_thread: threading.Thread | None = None
 
+# Colunas usadas na listagem (evita SELECT * em ~15k linhas). identity_source não é enviada pelo sync atual.
+_PROPERTIES_SELECT = (
+    "id,hash,titulo,preco,preco_texto,tipo,bairro,cidade,area_m2,quartos,banheiros,vagas,"
+    "url_anuncio,url_foto,site_name,site_id,primeira_vez,ultima_vez,data_quality_level"
+)
+
+
+def _pg_pattern_safe(fragment: str) -> str:
+    """Evita quebrar a gramática ``and=(...)`` do PostgREST (wildcards ``*`` e vírgulas)."""
+    return (
+        fragment.replace("*", "")
+        .replace(",", " ")
+        .replace("(", " ")
+        .replace(")", " ")
+        .strip()
+    )
+
+
+def _ilike_pattern(user_text: str) -> str:
+    """Monta trecho seguro para ``ilike.*…*``; espaços viram ``*`` (evita token quebrado no ``and=``)."""
+    frag = _pg_pattern_safe(user_text)
+    if not frag:
+        return ""
+    return "*".join(p for p in frag.split() if p)
+
+
+def _parse_content_range_total(header_val: str | None) -> int | None:
+    """Extrai o total a partir de ``Content-Range`` (ex.: ``0-9/15000`` ou ``*/15000``)."""
+    if not header_val:
+        return None
+    h = header_val.strip()
+    if "/" not in h:
+        return None
+    right = h.split("/")[-1].strip()
+    if right in ("*", ""):
+        return None
+    try:
+        return int(right)
+    except ValueError:
+        return None
+
+
+def _format_price_filter(n: float) -> str:
+    """Evita notação científica e ambiguidade de pontos em ``preco.gte.*``."""
+    if n == int(n):
+        return str(int(n))
+    return format(n, "f").rstrip("0").rstrip(".")
+
+
+class SupabasePropertiesRest:
+    """Cliente PostgREST para a tabela ``properties`` (mesma URL/chave que o sync no scraper)."""
+
+    def __init__(self, url: str, key: str, table: str) -> None:
+        self._url = f"{url.rstrip('/')}/rest/v1/{table}"
+        self._session = requests.Session()
+        self._session.headers.update(
+            {
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
+        )
+        self._timeout = (15, 90)
+
+    def _and_clause(
+        self,
+        *,
+        neighborhood: str | None,
+        property_type: str | None,
+        min_price: float | None,
+        max_price: float | None,
+    ) -> str:
+        parts = ["or(ativo.eq.true,ativo.eq.1)"]
+        if neighborhood and neighborhood.strip():
+            pat = _ilike_pattern(neighborhood.strip())
+            if pat:
+                parts.append(f"bairro.ilike.*{pat}*")
+        if property_type and property_type.strip():
+            pat = _ilike_pattern(property_type.strip())
+            if pat:
+                parts.append(f"tipo.ilike.*{pat}*")
+        if min_price is not None:
+            parts.append(f"preco.gte.{_format_price_filter(min_price)}")
+        if max_price is not None:
+            parts.append(f"preco.lte.{_format_price_filter(max_price)}")
+        return f"({','.join(parts)})"
+
+    def count_matching(
+        self,
+        *,
+        neighborhood: str | None,
+        property_type: str | None,
+        min_price: float | None,
+        max_price: float | None,
+    ) -> int:
+        params: dict[str, str] = {
+            "select": "hash",
+            "and": self._and_clause(
+                neighborhood=neighborhood,
+                property_type=property_type,
+                min_price=min_price,
+                max_price=max_price,
+            ),
+        }
+        headers = {**self._session.headers, "Prefer": "count=exact"}
+        r = self._session.head(self._url, params=params, headers=headers, timeout=self._timeout)
+        r.raise_for_status()
+        total = _parse_content_range_total(r.headers.get("Content-Range"))
+        if total is not None:
+            return total
+        r2 = self._session.get(
+            self._url,
+            params={**params, "limit": "1"},
+            headers=headers,
+            timeout=self._timeout,
+        )
+        r2.raise_for_status()
+        total2 = _parse_content_range_total(r2.headers.get("Content-Range"))
+        return int(total2) if total2 is not None else 0
+
+    def fetch_page(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        neighborhood: str | None,
+        property_type: str | None,
+        min_price: float | None,
+        max_price: float | None,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, str] = {
+            "select": _PROPERTIES_SELECT,
+            "and": self._and_clause(
+                neighborhood=neighborhood,
+                property_type=property_type,
+                min_price=min_price,
+                max_price=max_price,
+            ),
+            "order": "ultima_vez.desc",
+            "limit": str(limit),
+            "offset": str(offset),
+        }
+        r = self._session.get(self._url, params=params, timeout=self._timeout)
+        r.raise_for_status()
+        data = r.json()
+        return data if isinstance(data, list) else []
+
 
 def _listening_port() -> int:
     raw = os.environ.get("PORT")
@@ -46,9 +207,72 @@ def _listening_port() -> int:
     return int(API_PORT)
 
 
+def _init_supabase_properties_client() -> SupabasePropertiesRest | None:
+    if not SUPABASE_SYNC_ENABLED:
+        log.warning(
+            "SUPABASE_URL/SUPABASE_KEY ausentes — GET /api/v1/properties responderá 503 até configurar."
+        )
+        return None
+    try:
+        cli = SupabasePropertiesRest(SUPABASE_URL.strip(), SUPABASE_KEY, SUPABASE_TABLE)
+        log.info("Cliente PostgREST (Supabase) inicializado para a API (tabela %s).", SUPABASE_TABLE)
+        return cli
+    except Exception:
+        log.exception("Falha ao preparar cliente Supabase/PostgREST para a API")
+        return None
+
+
+def _count_active_properties(client: SupabasePropertiesRest | None) -> int | None:
+    if client is None:
+        return None
+    try:
+        return client.count_matching(
+            neighborhood=None,
+            property_type=None,
+            min_price=None,
+            max_price=None,
+        )
+    except Exception:
+        log.exception("Falha ao contar imóveis ativos no Supabase")
+        return None
+
+
+def _map_supabase_row_to_api_item(row: dict[str, Any]) -> dict[str, Any]:
+    """Mesmo formato que o endpoint SQLite antigo + ultima_coleta (alias de ultima_vez)."""
+    preco = row.get("preco")
+    ultima = row.get("ultima_vez")
+    out: dict[str, Any] = {
+        "id": row.get("id"),
+        "hash": row.get("hash"),
+        "titulo": row.get("titulo"),
+        "preco": preco,
+        "preco_numeric": preco,
+        "preco_texto": row.get("preco_texto"),
+        "tipo": row.get("tipo"),
+        "bairro": row.get("bairro"),
+        "cidade": row.get("cidade"),
+        "quartos": row.get("quartos"),
+        "banheiros": row.get("banheiros"),
+        "vagas": row.get("vagas"),
+        "url_anuncio": row.get("url_anuncio"),
+        "url_foto": row.get("url_foto"),
+        "site_name": row.get("site_name"),
+        "site_id": row.get("site_id"),
+        "primeira_vez": row.get("primeira_vez"),
+        "ultima_vez": ultima,
+        "ultima_coleta": ultima,
+        "data_quality_level": row.get("data_quality_level"),
+        "identity_source": row.get("identity_source"),
+        "area": row.get("area_m2"),
+    }
+    return out
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _scheduler_thread
+    app.state.supabase_properties = _init_supabase_properties_client()
+
     conn = sqlite3.connect(DB_FILE)
     init_db(conn)
     refresh_site_profiles(conn)
@@ -76,7 +300,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Robô Imobiliário API",
-    description="Leitura do SQLite local e disparo de coletas para o app Domus.",
+    description="Listagem de imóveis via Supabase; SQLite para coleta, logs e disparo de rodadas.",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -98,23 +322,23 @@ def get_db() -> sqlite3.Connection:
     return conn
 
 
-def _row_as_dict(r: sqlite3.Row) -> dict[str, Any]:
-    return {k: r[k] for k in r.keys()}
-
-
 @app.get("/health")
-def health() -> dict[str, Any]:
+def health(request: Request) -> dict[str, Any]:
     st = read_scheduler_state(ROOT) or {}
     alive = bool(_scheduler_thread and _scheduler_thread.is_alive())
+    client: SupabasePropertiesRest | None = getattr(request.app.state, "supabase_properties", None)
+    supabase_properties_count = _count_active_properties(client)
     return {
         "status": "ok",
         "scheduler_active": alive and SCHEDULE_ENABLED,
         "last_round_health": st.get("last_round_health") or "UNKNOWN",
+        "supabase_properties_count": supabase_properties_count,
     }
 
 
 @app.get("/api/v1/properties", dependencies=[Depends(require_api_key)])
 def list_properties(
+    request: Request,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     neighborhood: str | None = Query(None, description="Filtra bairro (contém, case-insensitive)"),
@@ -122,56 +346,45 @@ def list_properties(
     min_price: float | None = Query(None, ge=0),
     max_price: float | None = Query(None, ge=0),
 ) -> dict[str, Any]:
-    where = ["ativo = 1"]
-    args: list[Any] = []
-
-    if neighborhood and neighborhood.strip():
-        where.append("LOWER(bairro) LIKE LOWER(?)")
-        args.append(f"%{neighborhood.strip()}%")
-    if property_type and property_type.strip():
-        where.append("LOWER(tipo) LIKE LOWER(?)")
-        args.append(f"%{property_type.strip()}%")
-    if min_price is not None:
-        where.append(
-            "((COALESCE(preco_numeric, preco) IS NOT NULL) AND COALESCE(preco_numeric, preco) >= ?)"
+    client: SupabasePropertiesRest | None = getattr(request.app.state, "supabase_properties", None)
+    if client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Supabase não configurado ou indisponível. Defina SUPABASE_URL e SUPABASE_KEY "
+                "no ambiente e reinicie a API."
+            ),
         )
-        args.append(min_price)
-    if max_price is not None:
-        where.append(
-            "((COALESCE(preco_numeric, preco) IS NOT NULL) AND COALESCE(preco_numeric, preco) <= ?)"
-        )
-        args.append(max_price)
 
-    sql_where = " AND ".join(where)
-    conn = get_db()
     try:
-        cur = conn.execute(
-            f"SELECT COUNT(*) FROM imoveis WHERE {sql_where}",
-            args,
+        total = client.count_matching(
+            neighborhood=neighborhood,
+            property_type=property_type,
+            min_price=min_price,
+            max_price=max_price,
         )
-        total = int(cur.fetchone()[0])
-        cur = conn.execute(
-            f"""
-            SELECT id, hash, titulo, preco, preco_numeric, preco_texto, tipo, bairro, cidade, area_m2,
-                   quartos, banheiros, vagas, url_anuncio, url_foto, site_name, site_id,
-                   primeira_vez, ultima_vez, data_quality_level, identity_source
-            FROM imoveis
-            WHERE {sql_where}
-            ORDER BY ultima_vez DESC
-            LIMIT ? OFFSET ?
-            """,
-            [*args, limit, offset],
+        rows = client.fetch_page(
+            limit=limit,
+            offset=offset,
+            neighborhood=neighborhood,
+            property_type=property_type,
+            min_price=min_price,
+            max_price=max_price,
         )
-        rows = cur.fetchall()
-    finally:
-        conn.close()
+    except requests.RequestException as e:
+        log.exception("Erro HTTP ao consultar imóveis no Supabase")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Falha ao consultar Supabase (rede ou serviço indisponível).",
+        ) from e
+    except Exception as e:
+        log.exception("Erro ao consultar imóveis no Supabase")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Falha ao consultar Supabase: {type(e).__name__}",
+        ) from e
 
-    items = []
-    for r in rows:
-        d = _row_as_dict(r)
-        d["area"] = d.pop("area_m2", None)
-        items.append(d)
-
+    items = [_map_supabase_row_to_api_item(dict(r)) for r in rows]
     return {"total": total, "limit": limit, "offset": offset, "items": items}
 
 
