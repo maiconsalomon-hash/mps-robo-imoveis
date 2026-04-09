@@ -1714,6 +1714,8 @@ PLATFORM_FAMILY_APREME_PLAYWRIGHT = "apreme_playwright"
 PLATFORM_FAMILY_LOFT_PLAYWRIGHT = "loft_playwright"
 PLATFORM_FAMILY_IMOVIEW_IMOVEIS_AJAX = "imoview_imoveis_ajax"
 PLATFORM_FAMILY_PHP_ACAO_ATUALIZA_IMOVEIS = "php_acao_atualiza_imoveis"
+# Imoview site próprio (objImovel.js): POST form ``/retornar-imoveis-disponiveis`` → JSON lista + quantidade
+PLATFORM_FAMILY_RETORNAR_IMOVEIS_DISPONIVEIS = "retornar_imoveis_disponiveis"
 
 # Códigos de probe (API-first / operação)
 GERENCIAR_CF_PROBE_SUCCEEDED = "api_probe_succeeded"
@@ -1904,7 +1906,9 @@ def detect_platform_family(
     Retorna (family, diagnóstico). ``gerenciarimoveis_cf`` após assinatura de URL + probe na API
     Tecimob. ``vista_web_api`` após ``div.LI_Imovel`` + ``script.apre.me`` + probe POST ``/busca``.
     ``imoview_imoveis_ajax`` quando a URL segue ``/(venda|aluguel)/imoveis/…`` e o POST
-    ``/imoveis/ajax/`` devolve JSON com ``lista``. ``php_acao_atualiza_imoveis`` quando o HTML
+    ``/imoveis/ajax/`` devolve JSON com ``lista``. ``retornar_imoveis_disponiveis`` quando o HTML
+    carrega ``objImovel.js`` (ou cita ``retornar-imoveis-disponiveis``) e o POST no mesmo host
+    devolve JSON com ``lista`` e ``quantidade``. ``php_acao_atualiza_imoveis`` quando o HTML
     referencia ``acao-atualiza-imoveis.php`` e o GET com ``offset`` retorna JSON com ``results``.
     """
     diag: dict[str, Any] = {
@@ -1927,6 +1931,9 @@ def detect_platform_family(
         "php_acao_probe_used": False,
         "php_acao_probe_status": "",
         "php_acao_page_size_hint": 0,
+        "retornar_imoveis_html_signal": False,
+        "retornar_imoveis_probe_used": False,
+        "retornar_imoveis_probe_status": "",
     }
     if PLAYWRIGHT_ENABLED:
         h = _normalized_listing_host(listing_url)
@@ -1967,6 +1974,14 @@ def detect_platform_family(
         diag["imoview_ajax_quantidade"] = iprobe.get("quantidade_reported")
         if iprobe.get("ok"):
             return PLATFORM_FAMILY_IMOVIEW_IMOVEIS_AJAX, diag
+
+    if html and _listing_html_signals_retornar_imoveis_disponiveis(html):
+        diag["retornar_imoveis_html_signal"] = True
+        diag["retornar_imoveis_probe_used"] = True
+        rprobe = probe_retornar_imoveis_disponiveis(session, listing_url)
+        diag["retornar_imoveis_probe_status"] = str(rprobe.get("probe_status") or "")
+        if rprobe.get("ok"):
+            return PLATFORM_FAMILY_RETORNAR_IMOVEIS_DISPONIVEIS, diag
 
     php_html_sig = bool(html and _listing_html_signals_php_acao_atualiza_imoveis(html))
     php_url_sig = listing_url_signals_php_acao_atualiza_candidate(listing_url)
@@ -3068,6 +3083,398 @@ def extract_imoveis_imoview_imoveis_ajax_api(
     return all_items, meta_out
 
 
+# ── Imoview ``objImovel.js`` — POST ``/retornar-imoveis-disponiveis`` (form, mesmo host) ──
+RETORNAR_IMOVEIS_PAGE_SIZE_MAX = 20
+
+RETORNAR_IMOVEIS_PROBE_OK = "retornar_imoveis_ok"
+RETORNAR_IMOVEIS_PROBE_HTTP = "retornar_imoveis_http"
+RETORNAR_IMOVEIS_PROBE_NOT_JSON = "retornar_imoveis_not_json"
+RETORNAR_IMOVEIS_PROBE_SCHEMA = "retornar_imoveis_schema"
+RETORNAR_IMOVEIS_PROBE_EMPTY = "retornar_imoveis_empty"
+RETORNAR_IMOVEIS_PROBE_FAILED = "retornar_imoveis_failed"
+
+RETORNAR_IMOVEIS_STOP_COMPLETED = "retornar_imoveis_completed"
+RETORNAR_IMOVEIS_STOP_NO_NEW = "retornar_imoveis_no_new"
+RETORNAR_IMOVEIS_STOP_HTTP = "retornar_imoveis_http_error"
+RETORNAR_IMOVEIS_STOP_MAX_PAGES = "retornar_imoveis_max_pages"
+RETORNAR_IMOVEIS_STOP_TOTAL = "retornar_imoveis_total_reached"
+
+
+def _listing_html_signals_retornar_imoveis_disponiveis(html: str) -> bool:
+    """Página carrega o contrato Imoview (``objImovel.js``) ou cita o endpoint no HTML."""
+    if not html:
+        return False
+    h = html.lower()
+    if "retornar-imoveis-disponiveis" in h:
+        return True
+    if "objimovel.js" in h:
+        return True
+    if "assets/js/objimovel" in h:
+        return True
+    return False
+
+
+def _retornar_imoveis_disponiveis_api_url(listing_url: str) -> str:
+    pu = urlparse(listing_url)
+    origin = f"{pu.scheme or 'https'}://{pu.netloc}"
+    return urljoin(origin.rstrip("/") + "/", "retornar-imoveis-disponiveis")
+
+
+def _finalidade_retornar_imoveis_from_listing_url(listing_url: str) -> str:
+    """Valores enviados no POST: ``venda`` ou ``aluguel`` (front Imoview site próprio)."""
+    path = (urlparse(listing_url or "").path or "").lower()
+    if "/aluguel" in path or "/locacao" in path:
+        return "aluguel"
+    return "venda"
+
+
+def _ordenacao_retornar_imoveis_from_listing_url(listing_url: str) -> str:
+    q = parse_qs(urlparse(listing_url or "").query)
+    vals = q.get("ordenacao") or []
+    return (vals[0] or "").strip() if vals else ""
+
+
+def _retornar_imoveis_form_payload(
+    listing_url: str, *, pagina: int, page_size: int
+) -> dict[str, Any]:
+    """
+    Corpo flat ``application/x-www-form-urlencoded`` alinhado a ``assets/js/objImovel.js``
+    (campos omitidos no browser quando vazios; aqui enviamos defaults seguros).
+    """
+    ps = max(1, min(int(page_size), RETORNAR_IMOVEIS_PAGE_SIZE_MAX))
+    pg = max(1, int(pagina))
+    ordenacao = _ordenacao_retornar_imoveis_from_listing_url(listing_url)
+    return {
+        "finalidade": _finalidade_retornar_imoveis_from_listing_url(listing_url),
+        "codigounidade": "",
+        "codigocondominio": 0,
+        "codigoproprietario": 0,
+        "codigocaptador": 0,
+        "codigosimovei": 0,
+        "codigocidade": 0,
+        "codigoregiao": 0,
+        "endereco": "",
+        "edificio": "",
+        "numeroquartos": 0,
+        "numerovagas": 0,
+        "numerobanhos": 0,
+        "numerosuite": 0,
+        "numerovaranda": 0,
+        "numeroelevador": 0,
+        "valorde": 0,
+        "valorate": 0,
+        "areade": 0,
+        "areaate": 0,
+        "areaexternade": 0,
+        "areaexternaate": 0,
+        "destaque": 1,
+        "opcaoimovel": 3,
+        "retornomapaapp": "false",
+        "numeropagina": pg,
+        "numeroregistros": ps,
+        "ordenacao": ordenacao,
+        "codigoempreendimentomae": "",
+    }
+
+
+def _classify_retornar_imoveis_response(
+    r: requests.Response,
+) -> tuple[str, dict[str, Any] | None]:
+    if r.status_code != 200:
+        return f"{RETORNAR_IMOVEIS_PROBE_HTTP}:{r.status_code}", None
+    ct = (r.headers.get("content-type") or "").lower()
+    if "json" not in ct:
+        return f"{RETORNAR_IMOVEIS_PROBE_NOT_JSON}:{ct[:48]}", None
+    try:
+        body = r.json()
+    except json.JSONDecodeError:
+        return RETORNAR_IMOVEIS_PROBE_NOT_JSON, None
+    if not isinstance(body, dict):
+        return RETORNAR_IMOVEIS_PROBE_SCHEMA, None
+    lista = body.get("lista")
+    if not isinstance(lista, list):
+        return RETORNAR_IMOVEIS_PROBE_SCHEMA, None
+    if body.get("quantidade") is None:
+        return RETORNAR_IMOVEIS_PROBE_SCHEMA, None
+    if len(lista) == 0:
+        qn = body.get("quantidade")
+        try:
+            if int(str(qn).strip()) == 0:
+                return RETORNAR_IMOVEIS_PROBE_EMPTY, body
+        except (TypeError, ValueError):
+            pass
+        return RETORNAR_IMOVEIS_PROBE_EMPTY, body
+    first = lista[0]
+    if not isinstance(first, dict) or first.get("codigo") is None:
+        return RETORNAR_IMOVEIS_PROBE_SCHEMA, None
+    return RETORNAR_IMOVEIS_PROBE_OK, body
+
+
+def probe_retornar_imoveis_disponiveis(
+    session: requests.Session, listing_url: str
+) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "ok": False,
+        "probe_status": RETORNAR_IMOVEIS_PROBE_FAILED,
+        "http_status": None,
+        "quantidade_reported": None,
+    }
+    api = _retornar_imoveis_disponiveis_api_url(listing_url)
+    pu = urlparse(listing_url)
+    origin = f"{pu.scheme or 'https'}://{pu.netloc}"
+    payload = _retornar_imoveis_form_payload(listing_url, pagina=1, page_size=12)
+    try:
+        r = session.post(
+            api,
+            data=payload,
+            headers={
+                **HEADERS,
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Origin": origin,
+                "Referer": listing_url,
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests_exceptions.RequestException:
+        out["probe_status"] = RETORNAR_IMOVEIS_PROBE_FAILED
+        return out
+    out["http_status"] = r.status_code
+    st, body = _classify_retornar_imoveis_response(r)
+    out["probe_status"] = st
+    if body is not None and body.get("quantidade") is not None:
+        try:
+            out["quantidade_reported"] = int(str(body.get("quantidade")).strip())
+        except (TypeError, ValueError):
+            pass
+    if st == RETORNAR_IMOVEIS_PROBE_OK:
+        out["ok"] = True
+    elif st == RETORNAR_IMOVEIS_PROBE_EMPTY:
+        out["ok"] = True
+    return out
+
+
+def _area_m2_from_retornar_imoveis_row(row: dict[str, Any]) -> float | None:
+    raw = row.get("areainterna")
+    if isinstance(raw, str) and raw.strip():
+        s = raw.strip().replace(".", "").replace(",", ".")
+        try:
+            return float(s)
+        except ValueError:
+            pass
+    ap = row.get("areaprincipaltratado")
+    if isinstance(ap, (int, float)) and ap:
+        try:
+            return float(ap) / 100.0
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _intish(v: Any) -> int | None:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s or not s.isdigit():
+        return None
+    return int(s)
+
+
+def _imovel_dict_from_retornar_imoveis_row(
+    row: dict[str, Any], listing_url: str, site: dict
+) -> dict[str, Any] | None:
+    cod = row.get("codigo")
+    if cod is None:
+        return None
+    codigo_str = str(cod).strip()
+    if not codigo_str:
+        return None
+    pu = urlparse(listing_url)
+    origin = f"{pu.scheme or 'https'}://{pu.netloc}"
+    slug = (row.get("url_amigavel") or "").strip().strip("/")
+    if slug:
+        detail = urljoin(origin.rstrip("/") + "/", f"imovel/{slug}/{codigo_str}")
+    else:
+        detail = urljoin(origin.rstrip("/") + "/", f"imovel/{codigo_str}")
+
+    titulo = (row.get("titulo") or "").strip()[:200] or f"Imóvel {codigo_str}"
+    preco_texto = (row.get("valor") or "").strip()
+    preco = row.get("valortratado")
+    if preco is None and preco_texto:
+        preco = parse_preco(preco_texto)
+
+    tipo_txt = (row.get("tipo") or "").strip()
+    cf = row.get("codigofinalidade")
+    try:
+        cf_n = int(str(cf)) if cf is not None and str(cf).strip() != "" else None
+    except ValueError:
+        cf_n = None
+    if cf_n == 1:
+        finalidade = "alugar"
+    else:
+        finalidade = "venda"
+
+    foto = ""
+    fotos = row.get("fotos")
+    if isinstance(fotos, list) and fotos:
+        f0 = fotos[0]
+        if isinstance(f0, dict):
+            foto = (f0.get("url") or f0.get("urlp") or "").strip()
+
+    return {
+        "site_id": site["id"],
+        "site_name": site["name"],
+        "titulo": titulo,
+        "tipo": detect_tipo(titulo + " " + tipo_txt),
+        "finalidade": finalidade,
+        "preco_texto": preco_texto,
+        "preco": preco if isinstance(preco, (int, float)) else None,
+        "area_m2": _area_m2_from_retornar_imoveis_row(row),
+        "quartos": _intish(row.get("numeroquartos")),
+        "banheiros": _intish(row.get("numerobanhos")),
+        "vagas": _intish(row.get("numerovagas")),
+        "bairro": (row.get("bairro") or "")[:120],
+        "cidade": (row.get("cidade") or "")[:120],
+        "endereco": "",
+        "descricao": "",
+        "url_anuncio": detail,
+        "url_foto": foto[:500] if foto else "",
+        "codigo": codigo_str,
+    }
+
+
+def extract_imoveis_retornar_imoveis_disponiveis(
+    session: requests.Session,
+    listing_url: str,
+    site: dict,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    meta_out: dict[str, Any] = {
+        "pagination_pattern": "retornar_imoveis_numeropagina",
+        "pages_fetched": 0,
+        "total_items": 0,
+        "detail_links": 0,
+        "validation_reason": "",
+        "last_error": "",
+        "stop_reason": "",
+        "quantidade_reported": None,
+        "api_url": _retornar_imoveis_disponiveis_api_url(listing_url),
+        "page_size": RETORNAR_IMOVEIS_PAGE_SIZE_MAX,
+    }
+    api = meta_out["api_url"]
+    pu = urlparse(listing_url)
+    origin = f"{pu.scheme or 'https'}://{pu.netloc}"
+    page_size = RETORNAR_IMOVEIS_PAGE_SIZE_MAX
+    seen_codes: set[str] = set()
+    all_items: list[dict[str, Any]] = []
+    quantidade: int | None = None
+    page = 1
+
+    while page <= MAX_PAGES_PER_SITE:
+        payload = _retornar_imoveis_form_payload(
+            listing_url, pagina=page, page_size=page_size
+        )
+        try:
+            r = session.post(
+                api,
+                data=payload,
+                headers={
+                    **HEADERS,
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Origin": origin,
+                    "Referer": listing_url,
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+            st, body = _classify_retornar_imoveis_response(r)
+        except requests_exceptions.Timeout as e:
+            et, em = format_exception(e)
+            meta_out["last_error"] = f"{et}: {em}"
+            meta_out["stop_reason"] = RETORNAR_IMOVEIS_STOP_HTTP
+            break
+        except requests_exceptions.RequestException as e:
+            et, em = format_exception(e)
+            meta_out["last_error"] = f"{et}: {em}"
+            meta_out["stop_reason"] = RETORNAR_IMOVEIS_STOP_HTTP
+            break
+        except (json.JSONDecodeError, OSError) as e:
+            et, em = format_exception(e)
+            meta_out["last_error"] = f"{et}: {em}"
+            meta_out["stop_reason"] = RETORNAR_IMOVEIS_STOP_HTTP
+            break
+
+        if st != RETORNAR_IMOVEIS_PROBE_OK or not isinstance(body, dict):
+            meta_out["last_error"] = str(st)
+            meta_out["stop_reason"] = RETORNAR_IMOVEIS_STOP_HTTP if page == 1 else str(st)
+            break
+
+        meta_out["pages_fetched"] = page
+        if quantidade is None and body.get("quantidade") is not None:
+            try:
+                quantidade = int(str(body.get("quantidade")).strip())
+            except (TypeError, ValueError):
+                quantidade = None
+            meta_out["quantidade_reported"] = quantidade
+
+        lista = body.get("lista")
+        if not isinstance(lista, list) or len(lista) == 0:
+            meta_out["stop_reason"] = (
+                RETORNAR_IMOVEIS_STOP_NO_NEW if all_items else RETORNAR_IMOVEIS_PROBE_EMPTY
+            )
+            break
+
+        new_n = 0
+        for row in lista:
+            if not isinstance(row, dict):
+                continue
+            c = str(row.get("codigo") or "").strip()
+            if not c or c in seen_codes:
+                continue
+            item = _imovel_dict_from_retornar_imoveis_row(row, listing_url, site)
+            if not item:
+                continue
+            seen_codes.add(c)
+            all_items.append(item)
+            new_n += 1
+
+        if new_n == 0:
+            meta_out["stop_reason"] = RETORNAR_IMOVEIS_STOP_NO_NEW
+            break
+
+        if quantidade is not None and quantidade > 0 and len(all_items) >= quantidade:
+            meta_out["stop_reason"] = RETORNAR_IMOVEIS_STOP_TOTAL
+            break
+
+        if page >= MAX_PAGES_PER_SITE:
+            meta_out["stop_reason"] = RETORNAR_IMOVEIS_STOP_MAX_PAGES
+            break
+
+        page += 1
+
+    if not meta_out["stop_reason"] and all_items:
+        meta_out["stop_reason"] = RETORNAR_IMOVEIS_STOP_COMPLETED
+
+    meta_out["total_items"] = len(all_items)
+    meta_out["detail_links"] = sum(1 for x in all_items if x.get("url_anuncio"))
+    meta_out["validation_reason"] = (
+        "retornar_imoveis_disponiveis_json"
+        if all_items
+        else (meta_out.get("last_error") or "retornar_imoveis_empty")
+    )
+
+    log.info(
+        "Retornar-imoveis-disponiveis: %s — %s imóveis | páginas=%s | stop=%s | quantidade=%s",
+        site["name"],
+        meta_out["total_items"],
+        meta_out["pages_fetched"],
+        meta_out.get("stop_reason") or "?",
+        meta_out.get("quantidade_reported"),
+    )
+    return all_items, meta_out
+
+
 # ── PHP Sami-style — GET …/includes/vendas/acao-atualiza-imoveis.php?offset= (JSON.results HTML) ──
 PHP_ACAO_PROBE_OK = "php_acao_ok"
 PHP_ACAO_PROBE_HTTP = "php_acao_http"
@@ -3330,6 +3737,9 @@ def _register_api_first_families() -> None:
     API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_PHP_ACAO_ATUALIZA_IMOVEIS] = (
         extract_imoveis_php_acao_atualiza_imoveis
     )
+    API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_RETORNAR_IMOVEIS_DISPONIVEIS] = (
+        extract_imoveis_retornar_imoveis_disponiveis
+    )
 
 
 _register_api_first_families()
@@ -3370,6 +3780,8 @@ def dispatch_api_first_family_extract(
         return extract_imoveis_imoview_imoveis_ajax_api(session, listing_url, site)
     if family == PLATFORM_FAMILY_PHP_ACAO_ATUALIZA_IMOVEIS:
         return extract_imoveis_php_acao_atualiza_imoveis(session, listing_url, site)
+    if family == PLATFORM_FAMILY_RETORNAR_IMOVEIS_DISPONIVEIS:
+        return extract_imoveis_retornar_imoveis_disponiveis(session, listing_url, site)
     return None
 
 
@@ -5953,6 +6365,35 @@ def scrape_site(
                     summary.notes.append(
                         json.dumps(
                             {"php_acao_atualiza_imoveis_api": api_meta, "family_detection": fam_diag},
+                            ensure_ascii=False,
+                        )
+                    )
+                elif plat_fam == PLATFORM_FAMILY_RETORNAR_IMOVEIS_DISPONIVEIS:
+                    _pair = dispatch_api_first_family_extract(
+                        PLATFORM_FAMILY_RETORNAR_IMOVEIS_DISPONIVEIS,
+                        session,
+                        url_final,
+                        site,
+                    )
+                    imoveis_pagina, api_meta = (
+                        _pair if _pair is not None else ([], {"validation_reason": "dispatch_returned_none"})
+                    )
+                    used_api_first_listing = True
+                    summary.family_specific_extractor_used = True
+                    summary.family_card_count = int(api_meta.get("total_items") or 0)
+                    summary.family_detail_links_count = int(api_meta.get("detail_links") or 0)
+                    summary.family_pagination_pattern_detected = str(
+                        api_meta.get("pagination_pattern") or ""
+                    )
+                    summary.family_listing_validation_reason = str(
+                        api_meta.get("validation_reason") or ""
+                    )
+                    summary.notes.append(
+                        json.dumps(
+                            {
+                                "retornar_imoveis_disponiveis_api": api_meta,
+                                "family_detection": fam_diag,
+                            },
                             ensure_ascii=False,
                         )
                     )
