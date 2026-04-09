@@ -63,6 +63,7 @@ from pagination_guard import (  # noqa: E402
     CODE_EMPTY,
     CODE_REPEATED,
     CODE_SAME_PAGE,
+    hosts_compatible,
     normalize_pagination_url,
     validate_next_page_url,
 )
@@ -2182,6 +2183,172 @@ def detect_tipo(text: str) -> str:
     return "outros"
 
 
+def _listing_urls_same_after_redirect(requested_url: str, final_url: str) -> bool:
+    """True se o redirect só canoniza a mesma página (ex. ``?pag=2`` → ``?&pag=2``)."""
+    pa, pb = urlparse(requested_url), urlparse(final_url)
+    if (
+        (pa.scheme or "").lower() != (pb.scheme or "").lower()
+        or pa.netloc.lower() != pb.netloc.lower()
+    ):
+        return False
+    if pa.path.rstrip("/") != pb.path.rstrip("/"):
+        return False
+
+    def norm_q(qs: str) -> dict[str, tuple[str, ...]]:
+        raw = parse_qs(qs or "", keep_blank_values=False)
+        return {k: tuple(raw[k]) for k in sorted(raw.keys())}
+
+    return norm_q(pa.query) == norm_q(pb.query)
+
+
+def _listing_page_number_from_url(url: str) -> int:
+    """Número da página de listagem inferido da URL (1 se não houver indício)."""
+    pu = urlparse(url)
+    q = parse_qs(pu.query)
+    for key in ("pagina", "page", "pag", "pg", "p"):
+        vals = q.get(key) or []
+        if vals:
+            try:
+                return max(1, int(str(vals[0]).strip()))
+            except ValueError:
+                pass
+    path = pu.path or ""
+    m = re.search(r"/pagina-(\d+)(/|$)", path, re.I)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"/(?:page|pagina)/(\d+)(/|$)", path, re.I)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"/(\d+)(/?)$", path)
+    if m:
+        return int(m.group(1))
+    return 1
+
+
+def discover_next_listing_page_from_anchors(
+    html: str, current_url: str, next_page_index: int
+) -> str | None:
+    """
+    Descobre próxima URL a partir de links reais no HTML (``pagina=``, ``page=``, ``/pagina-N``,
+    ``javascript:...paginacao('...')``), limitado ao mesmo site que ``current_url``.
+    Usado por listagens cuja primeira página não traz o parâmetro na URL (ex.: ``&pagina=2`` só no href).
+    """
+    if next_page_index < 2:
+        return None
+    soup = BeautifulSoup(html, "html.parser")
+    candidates: list[tuple[int, str]] = []
+    seen_anchor_ids: set[int] = set()
+
+    container_selectors = (
+        ".pagination",
+        ".paginacao",
+        "[class*='pagination']",
+        "[class*='paginacao']",
+    )
+    groups: list = []
+    for sel in container_selectors:
+        root = soup.select_one(sel)
+        if root:
+            groups.append(root.select("a[href]"))
+    groups.append(soup.select("a[href]"))
+
+    for group in groups:
+        for a in group:
+            aid = id(a)
+            if aid in seen_anchor_ids:
+                continue
+            seen_anchor_ids.add(aid)
+            raw = (a.get("href") or "").strip()
+            if not raw or raw.startswith("#"):
+                continue
+            cand_url: str | None = None
+            page_n: int | None = None
+            low = raw.lower()
+            if low.startswith("javascript:"):
+                jm = re.search(r"paginacao\s*\(\s*['\"]([^'\"]+)['\"]", raw, re.I)
+                if not jm:
+                    jm = re.search(r"['\"]([/][^'\"]*pagina[-/]\d+[^'\"]*)['\"]", raw, re.I)
+                if jm:
+                    path = jm.group(1).strip()
+                    cand_url = urljoin(current_url, path)
+                    pm = re.search(r"pagina[-/](\d+)", path, re.I)
+                    if pm:
+                        page_n = int(pm.group(1))
+            else:
+                cand_url = urljoin(current_url, raw)
+                if not hosts_compatible(current_url, cand_url):
+                    continue
+                pm = re.search(r"[?&](pagina|page|pag|pg|p)=(\d+)", cand_url, re.I)
+                if pm:
+                    page_n = int(pm.group(2))
+                else:
+                    pm = re.search(r"/pagina-(\d+)(/|$|\?|#)", cand_url, re.I)
+                    if pm:
+                        page_n = int(pm.group(1))
+                    else:
+                        pm = re.search(r"/(?:page|pagina)/(\d+)(/|$|\?|#)", cand_url, re.I)
+                        if pm:
+                            page_n = int(pm.group(1))
+            if (
+                page_n is not None
+                and cand_url
+                and page_n >= next_page_index
+                and hosts_compatible(current_url, cand_url)
+            ):
+                clean = cand_url.split("#")[0]
+                if clean.rstrip("/") != current_url.split("#")[0].rstrip("/"):
+                    candidates.append((page_n, clean))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x[0], len(x[1])))
+    return candidates[0][1]
+
+
+def html_listing_has_actionable_pagination(html: str, listing_url: str) -> bool:
+    """Há no HTML algum link/rel inequívoco de próxima página no mesmo site."""
+    soup = BeautifulSoup(html, "html.parser")
+    for sel in ["a[rel='next']", "link[rel='next']"]:
+        el = soup.select_one(sel)
+        if el and el.get("href") and hosts_compatible(listing_url, urljoin(listing_url, el["href"])):
+            return True
+    cur_n = _listing_page_number_from_url(listing_url)
+    if discover_next_listing_page_from_anchors(html, listing_url, cur_n + 1):
+        return True
+    for sel in [
+        "[class*='pagination'] a[class*='active'] + a",
+        "[class*='paginacao'] a[class*='ativo'] + a",
+    ]:
+        el = soup.select_one(sel)
+        if el and el.get("href"):
+            href = el["href"].strip()
+            if href and not href.startswith("#") and not href.lower().startswith("javascript:"):
+                nu = urljoin(listing_url, href)
+                if nu != listing_url and hosts_compatible(listing_url, nu):
+                    return True
+    return False
+
+
+def _spa_listing_shell_without_followable_html_pagination(html: str) -> bool:
+    """
+    Shells que hidratam paginação só via JS / API: HTML inicial sem href útil.
+    Evita ``has_more=True`` genérico + ``get_next=None`` → ERRO_PAGINACAO.
+    """
+    if "script.apre.me" in html:
+        soup = BeautifulSoup(html, "html.parser")
+        pel = soup.select_one("div.PaginationImovel")
+        if pel is not None and not pel.select(
+            "a[href]:not([href^='#']):not([href^='javascript:'])"
+        ):
+            if not soup.select_one("a[rel='next'][href], link[rel='next'][href]"):
+                return True
+    if "apiimoveisv3.casasoftsig.com" in html and "script.apre.me" not in html:
+        return True
+    if "loftcdn.gtmcapital.com" in html or "gtmcapital.com.br" in html:
+        return True
+    return False
+
+
 def get_next_page_url(html: str, current_url: str, page_num: int) -> str | None:
     """
     Detecta a URL da próxima página.
@@ -2199,10 +2366,52 @@ def get_next_page_url(html: str, current_url: str, page_num: int) -> str | None:
         el = soup.select_one(sel)
         if el and el.get("href"):
             next_url = urljoin(current_url, el["href"])
-            if next_url != current_url:
+            if next_url != current_url and hosts_compatible(current_url, next_url):
                 return next_url
 
-    # 2) Botão/link de próxima página por texto ou classe
+    # 2) Query string na URL atual: ?page=N, ?pagina=N, ?pag=N, ?pg=N
+    for pattern in [r"([?&])(pagina|page|pag|pg|p)=(\d+)"]:
+        m = re.search(pattern, current_url, re.I)
+        if m:
+            old_val = int(m.group(3))
+            new_val = old_val + 1
+            return current_url[:m.start(1)] + m.group(1) + m.group(2) + "=" + str(new_val) + current_url[m.end():]
+
+    # 3) Offset: ?offset=N&limit=M  (Kenlo, mouraimoveis, etc.)
+    m = re.search(r"([?&])(offset)=(\d+)", current_url, re.I)
+    if m:
+        old_val = int(m.group(3))
+        step_m = re.search(r"limit=(\d+)", current_url, re.I)
+        step = int(step_m.group(1)) if step_m else 21
+        new_val = old_val + step
+        return current_url[:m.start(1)] + m.group(1) + "offset=" + str(new_val) + current_url[m.end():]
+
+    # 4) Padrão /pagina-N (hífen)
+    m = re.search(r"/pagina-(\d+)(/|$)", current_url, re.I)
+    if m:
+        new_num = int(m.group(1)) + 1
+        return current_url[:m.start()] + f"/pagina-{new_num}" + m.group(2)
+
+    # 5) Path /page/N/ ou /pagina/N/
+    m = re.search(r"/(page|pagina)/(\d+)(/|$)", current_url, re.I)
+    if m:
+        new_num = int(m.group(2)) + 1
+        return current_url[:m.start()] + f"/{m.group(1)}/{new_num}" + m.group(3)
+
+    # 6) Path numérico no final: /imoveis/venda/2
+    m = re.search(r"/(\d+)(/?)$", current_url)
+    if m:
+        cur_num = int(m.group(1))
+        if cur_num == page_num - 1 or cur_num == 1:
+            new_num = cur_num + 1
+            return current_url[:m.start()] + f"/{new_num}" + m.group(2)
+
+    # 7) Links reais no HTML (``&pagina=2``, ``//host/...``, ``javascript:paginacao(...)``)
+    found = discover_next_listing_page_from_anchors(html, current_url, page_num)
+    if found:
+        return found
+
+    # 8) Heurísticas genéricas (somente mesmo site — evita links externos tipo bancos)
     for sel in [
         ".next a", "[class*='next'] a", "[class*='proxim'] a",
         "a[class*='next']", "a[aria-label*='próxima']", "a[aria-label*='next']",
@@ -2212,53 +2421,12 @@ def get_next_page_url(html: str, current_url: str, page_num: int) -> str | None:
         el = soup.select_one(sel)
         if el and el.get("href"):
             href = el["href"].strip()
-            if href and href != "#":
+            if href and href != "#" and not href.lower().startswith("javascript:"):
                 next_url = urljoin(current_url, href)
-                if next_url != current_url:
+                if next_url != current_url and hosts_compatible(current_url, next_url):
                     return next_url
 
-    # 3) Query string primeiro (mais específico que path): ?page=N, ?pagina=N, ?pg=N
-    for pattern in [r"([?&])(page|pagina|pg|p)=(\d+)"]:
-        m = re.search(pattern, current_url, re.I)
-        if m:
-            old_val = int(m.group(3))
-            new_val = old_val + 1
-            return current_url[:m.start(1)] + m.group(1) + m.group(2) + "=" + str(new_val) + current_url[m.end():]
-
-    # 4) Offset: ?offset=N&limit=M  (Kenlo, mouraimoveis, etc.)
-    m = re.search(r"([?&])(offset)=(\d+)", current_url, re.I)
-    if m:
-        old_val = int(m.group(3))
-        step_m = re.search(r"limit=(\d+)", current_url, re.I)
-        step = int(step_m.group(1)) if step_m else 21
-        new_val = old_val + step
-        return current_url[:m.start(1)] + m.group(1) + "offset=" + str(new_val) + current_url[m.end():]
-
-    # 5) Padrão Apre.me: /pagina-N (hífen, sem barra)
-    #    ex: /imoveis/venda/pagina-2  →  /imoveis/venda/pagina-3
-    m = re.search(r"/pagina-(\d+)(/|$)", current_url, re.I)
-    if m:
-        new_num = int(m.group(1)) + 1
-        return current_url[:m.start()] + f"/pagina-{new_num}" + m.group(2)
-
-    # 6) Padrão path com barra: /page/N/ ou /pagina/N/
-    m = re.search(r"/(page|pagina)/(\d+)(/|$)", current_url, re.I)
-    if m:
-        new_num = int(m.group(2)) + 1
-        return current_url[:m.start()] + f"/{m.group(1)}/{new_num}" + m.group(3)
-
-    # 7) Padrão path numérico simples no final: /imoveis/venda/2 ou /todos/1
-    m = re.search(r"/(\d+)(/?)$", current_url)
-    if m:
-        cur_num = int(m.group(1))
-        # aceita: o número no path é a página atual (page_num-1) ou é 1 (primeira página)
-        if cur_num == page_num - 1 or cur_num == 1:
-            new_num = cur_num + 1
-            return current_url[:m.start()] + f"/{new_num}" + m.group(2)
-
-    # 8) Última tentativa: URL sem paginação ainda → adiciona /pagina-2
-    #    Só aplica se o HTML contiver referência a "pagina-2" (confirma que o site usa esse padrão)
-    #    Isso evita gerar URLs inválidas em sites que usam query string ou outro padrão
+    # 9) URL sem /pagina-N ainda → /pagina-2 se o HTML indicar esse padrão
     if page_num == 2 and not re.search(r"/pagina[-/]\d+", current_url, re.I):
         if re.search(r'href=["\'][^"\']*pagina[-/]2|pagina=2|page=2', html, re.I):
             base = current_url.rstrip("/").split("?")[0]
@@ -2302,10 +2470,15 @@ def dedupe_imoveis_novos_na_sessao(
     return out
 
 
-def has_more_results(html: str, imoveis_count: int) -> bool:
+def has_more_results(
+    html: str, imoveis_count: int, listing_url: str | None = None
+) -> bool:
     """
     Verifica se há mais páginas detectando sinais de fim de resultados.
     Retorna False quando claramente não há mais imóveis.
+
+    ``listing_url``: URL da listagem atual; permite detectar shells SPA sem paginação
+    followável no HTML (Apre.me, Casasoft/Jet, Loft) e evitar ERRO_PAGINACAO falso.
     """
     if imoveis_count == 0:
         return False
@@ -2340,12 +2513,23 @@ def has_more_results(html: str, imoveis_count: int) -> bool:
         if re.search(rx, text):
             return False
 
-    # Verifica se link "próximo" existe
+    if listing_url:
+        if html_listing_has_actionable_pagination(html, listing_url):
+            return True
+        if _spa_listing_shell_without_followable_html_pagination(html):
+            return False
+
     for sel in ["a[rel='next']", ".next a", "[class*='next'] a"]:
-        if soup.select_one(sel):
+        el = soup.select_one(sel)
+        if not el or not el.get("href"):
+            continue
+        if listing_url:
+            nu = urljoin(listing_url, el["href"])
+            if hosts_compatible(listing_url, nu):
+                return True
+        else:
             return True
 
-    # Se chegou aqui e tem imóveis, assume que pode ter mais
     return imoveis_count > 0
 
 
@@ -3757,13 +3941,16 @@ def scrape_site(
                 pagination_seen.add(norm_listing)
 
             if url_final != url and page_num > 1:
-                summary.warnings.append(
-                    f"Redirect na paginação (página {page_num}): {url[:70]}… → {url_final[:70]}…"
-                )
-                log.info(
-                    f"    Redirect detectado ({url} → {url_final}) — fim da paginação"
-                )
-                break
+                if _listing_urls_same_after_redirect(url, url_final):
+                    pass
+                else:
+                    summary.warnings.append(
+                        f"Redirect na paginação (página {page_num}): {url[:70]}… → {url_final[:70]}…"
+                    )
+                    log.info(
+                        f"    Redirect detectado ({url} → {url_final}) — fim da paginação"
+                    )
+                    break
 
             used_gerenciar_cf_api = False
             imoveis_pagina: list[dict[str, Any]] = []
@@ -3935,7 +4122,7 @@ def scrape_site(
                 break
 
             prev_deduped_count = n_page
-            prev_had_more = has_more_results(html, len(imoveis_pagina))
+            prev_had_more = has_more_results(html, len(imoveis_pagina), url_final)
 
             if not prev_had_more:
                 log.info(f"    Sem mais resultados — encerrando paginação")
