@@ -28,6 +28,9 @@ de cards no HTML (evita ``ERRO_LISTAGEM_INVALIDA`` nesse shell).
 Sites Apresenta.me / Vista Web (``script.apre.me``, cards ``div.LI_Imovel``, ``var $CONFIG``)
 paginam via POST JSON ``/busca`` (campo ``html`` + ``total``; parâmetro acumulativo ``LIMIT``);
 família ``vista_web_api`` — sem JSON puro de lista, mas consumível com ``requests`` (sem Playwright).
+Sites no padrão Imoview (URL ``/(venda|aluguel)/imoveis/...`` com filtros no path) carregam cards via
+POST ``/imoveis/ajax/`` (corpo ``imovel[...]`` como no ``busca.js`` do site). CRM PHP Sami / semelhantes
+expõem ``/includes/vendas/acao-atualiza-imoveis.php?offset=`` retornando JSON com HTML em ``results``.
 """
 
 import sqlite3
@@ -45,7 +48,7 @@ import contextlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse, urlunparse
 
 import requests
 from requests import exceptions as requests_exceptions
@@ -1709,6 +1712,8 @@ PLATFORM_FAMILY_GERENCIAR_IMOVEIS_CF = "gerenciarimoveis_cf"
 PLATFORM_FAMILY_VISTA_WEB_API = "vista_web_api"
 PLATFORM_FAMILY_APREME_PLAYWRIGHT = "apreme_playwright"
 PLATFORM_FAMILY_LOFT_PLAYWRIGHT = "loft_playwright"
+PLATFORM_FAMILY_IMOVIEW_IMOVEIS_AJAX = "imoview_imoveis_ajax"
+PLATFORM_FAMILY_PHP_ACAO_ATUALIZA_IMOVEIS = "php_acao_atualiza_imoveis"
 
 # Códigos de probe (API-first / operação)
 GERENCIAR_CF_PROBE_SUCCEEDED = "api_probe_succeeded"
@@ -1898,6 +1903,9 @@ def detect_platform_family(
     """
     Retorna (family, diagnóstico). ``gerenciarimoveis_cf`` após assinatura de URL + probe na API
     Tecimob. ``vista_web_api`` após ``div.LI_Imovel`` + ``script.apre.me`` + probe POST ``/busca``.
+    ``imoview_imoveis_ajax`` quando a URL segue ``/(venda|aluguel)/imoveis/…`` e o POST
+    ``/imoveis/ajax/`` devolve JSON com ``lista``. ``php_acao_atualiza_imoveis`` quando o HTML
+    referencia ``acao-atualiza-imoveis.php`` e o GET com ``offset`` retorna JSON com ``results``.
     """
     diag: dict[str, Any] = {
         "listing_url_signal": False,
@@ -1913,6 +1921,12 @@ def detect_platform_family(
         "vista_busca_probe_status": "",
         "vista_busca_page_size": 18,
         "vista_busca_finalidade": "sale",
+        "imoview_ajax_probe_used": False,
+        "imoview_ajax_probe_status": "",
+        "imoview_ajax_quantidade": None,
+        "php_acao_probe_used": False,
+        "php_acao_probe_status": "",
+        "php_acao_page_size_hint": 0,
     }
     if PLAYWRIGHT_ENABLED:
         h = _normalized_listing_host(listing_url)
@@ -1945,6 +1959,24 @@ def detect_platform_family(
         diag["vista_busca_finalidade"] = str(vprobe.get("finalidade") or "sale")
         if vprobe.get("ok"):
             return PLATFORM_FAMILY_VISTA_WEB_API, diag
+
+    if listing_url_signals_imoview_imoveis_ajax(listing_url):
+        diag["imoview_ajax_probe_used"] = True
+        iprobe = probe_imoview_imoveis_ajax(session, listing_url)
+        diag["imoview_ajax_probe_status"] = str(iprobe.get("probe_status") or "")
+        diag["imoview_ajax_quantidade"] = iprobe.get("quantidade_reported")
+        if iprobe.get("ok"):
+            return PLATFORM_FAMILY_IMOVIEW_IMOVEIS_AJAX, diag
+
+    php_html_sig = bool(html and _listing_html_signals_php_acao_atualiza_imoveis(html))
+    php_url_sig = listing_url_signals_php_acao_atualiza_candidate(listing_url)
+    if php_html_sig or php_url_sig:
+        diag["php_acao_probe_used"] = True
+        pprobe = probe_php_acao_atualiza_imoveis(session, listing_url)
+        diag["php_acao_probe_status"] = str(pprobe.get("probe_status") or "")
+        diag["php_acao_page_size_hint"] = int(pprobe.get("page_size_hint") or 0)
+        if pprobe.get("ok"):
+            return PLATFORM_FAMILY_PHP_ACAO_ATUALIZA_IMOVEIS, diag
 
     return PLATFORM_FAMILY_GENERIC, diag
 
@@ -2607,11 +2639,697 @@ def extract_imoveis_vista_web_busca_api(
     return all_items, meta_out
 
 
+# ── Imoview (busca.js) — POST /imoveis/ajax/ (form imovel[...], JSON quantidade + lista) ──
+IMOVIEW_AJAX_PROBE_OK = "imoview_ajax_ok"
+IMOVIEW_AJAX_PROBE_HTTP = "imoview_ajax_http"
+IMOVIEW_AJAX_PROBE_NOT_JSON = "imoview_ajax_not_json"
+IMOVIEW_AJAX_PROBE_INVALID_JSON = "imoview_ajax_invalid_json"
+IMOVIEW_AJAX_PROBE_SCHEMA = "imoview_ajax_schema"
+IMOVIEW_AJAX_PROBE_EMPTY = "imoview_ajax_empty_list"
+IMOVIEW_AJAX_PROBE_FAILED = "imoview_ajax_failed"
+
+IMOVIEW_AJAX_STOP_COMPLETED = "imoview_completed"
+IMOVIEW_AJAX_STOP_TOTAL = "imoview_reached_quantidade"
+IMOVIEW_AJAX_STOP_NO_NEW = "imoview_no_new_items"
+IMOVIEW_AJAX_STOP_HTTP = "imoview_http_error"
+IMOVIEW_AJAX_STOP_MAX_PAGES = "imoview_max_pages"
+
+
+def listing_url_signals_imoview_imoveis_ajax(listing_url: str) -> bool:
+    """
+    Listagem com filtros no path: ``/(venda|aluguel)/imoveis/<cidade>/<bairro>/…``.
+    Mesmo shell usado por imobiliariabarrasul / itatimoveis (cards via AJAX).
+    """
+    pu = urlparse(listing_url or "")
+    segs = [s.lower() for s in (pu.path or "").split("/") if s]
+    if len(segs) < 9:
+        return False
+    if segs[0] not in ("venda", "aluguel"):
+        return False
+    if segs[1] != "imoveis":
+        return False
+    return True
+
+
+def _imoview_numerovagas_api_value(segment: str) -> str:
+    s = (segment or "").strip().lower()
+    if s in ("", "0-vaga-ou-mais", "0-vaga"):
+        return "0-vaga-ou-mais"
+    if s == "1-vaga-ou-mais":
+        return "1-vaga-ou-mais"
+    if s == "2-vaga-ou-mais":
+        return "2-vaga-ou-mais"
+    if s == "3-vaga-ou-mais":
+        return "3-vaga-ou-mais"
+    if s == "4-vaga-ou-mais":
+        return "4-vaga-ou-mais"
+    if s.startswith("0-vaga"):
+        return "0-vaga-ou-mais"
+    return s
+
+
+def _imoview_imovel_payload_from_listing_url(listing_url: str, *, page: int) -> dict[str, Any]:
+    """Monta o objeto ``imovel`` alinhado ao ``busca.js`` (defaults + path + query)."""
+    pu = urlparse(listing_url)
+    segs = [s for s in (pu.path or "").split("/") if s]
+    segs_l = [s.lower() for s in segs]
+    finalidade = segs_l[0] if segs_l else "venda"
+    cidade_seg = segs[3] if len(segs) > 3 else "todas-as-cidades"
+    bairro_seg = segs[4] if len(segs) > 4 else "todos-os-bairros"
+    quartos_seg = segs[5] if len(segs) > 5 else "0-quartos"
+    suite_seg = segs[6] if len(segs) > 6 else "0-suite-ou-mais"
+    vagas_seg = segs[7] if len(segs) > 7 else "0-vaga"
+    banho_raw = segs[8] if len(segs) > 8 else "0-banheiro-ou-mais"
+    banho_seg = (banho_raw.split("?")[0] or "0-banheiro-ou-mais").lower()
+    condo_raw = segs[9] if len(segs) > 9 else "todos-os-condominios"
+    condo_seg = condo_raw.split("?")[0]
+
+    q = parse_qs(pu.query or "")
+    def _q1(key: str, default: str) -> str:
+        vals = q.get(key) or []
+        if not vals or vals[0] is None or str(vals[0]).strip() == "":
+            return default
+        return str(vals[0]).strip()
+
+    valmin = _q1("valorminimo", "0")
+    valmax = _q1("valormaximo", "0")
+    areamin = _q1("areade", "0")
+    areamax = _q1("areaate", "0")
+
+    codigocidade: int | str = 0
+    if cidade_seg.lower() != "todas-as-cidades":
+        codigocidade = cidade_seg
+
+    imovel: dict[str, Any] = {
+        "finalidade": finalidade,
+        "codigounidade": "",
+        "codigosimoveis": "",
+        "codigoTipo": {"codigo": [], "nome": ["imoveis"]},
+        "codigocidade": codigocidade,
+        "codigoregiao": 0,
+        "codigosbairros": {"codigo": [], "nome": []},
+        "endereco": 0,
+        "numeroquartos": quartos_seg.lower(),
+        "numerovagas": _imoview_numerovagas_api_value(vagas_seg),
+        "numerobanhos": banho_seg,
+        "numerosuite": suite_seg.lower(),
+        "numerovaranda": 0,
+        "numeroelevador": 0,
+        "valorde": valmin,
+        "valorate": valmax,
+        "areade": areamin,
+        "areaate": areamax,
+        "extras": 0,
+        "extends": False,
+        "mobiliado": False,
+        "dce": False,
+        "piscina": False,
+        "sauna": False,
+        "salaofestas": False,
+        "academia": False,
+        "boxDespejo": False,
+        "portaria24h": False,
+        "aceitafinanciamento": False,
+        "arealazer": False,
+        "quartoqtdeexata": False,
+        "vagaqtdexata": False,
+        "destaque": 0,
+        "opcaoimovel": 4,
+        "retornomapa": False,
+        "retornomapaapp": False,
+        "numeropagina": page,
+        "numeroregistros": 50,
+        "ordenacao": "valordesc",
+        "pagina": page,
+        "codigocondominio": "0",
+        "condominio": [condo_seg],
+    }
+    if bairro_seg.lower() == "todos-os-bairros":
+        imovel["codigosbairros"] = {"codigo": [], "nome": []}
+    return imovel
+
+
+def _flatten_imoview_form(prefix: str, obj: Any, out: list[tuple[str, str]]) -> None:
+    if obj is None:
+        return
+    if isinstance(obj, bool):
+        out.append((prefix, "true" if obj else "false"))
+    elif isinstance(obj, (int, float)):
+        out.append((prefix, str(obj)))
+    elif isinstance(obj, str):
+        out.append((prefix, obj))
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            _flatten_imoview_form(f"{prefix}[{k}]", v, out)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            _flatten_imoview_form(f"{prefix}[{i}]", v, out)
+    else:
+        out.append((prefix, str(obj)))
+
+
+def _imoview_ajax_post_body(imovel_obj: dict[str, Any]) -> bytes:
+    pairs: list[tuple[str, str]] = []
+    _flatten_imoview_form("imovel", imovel_obj, pairs)
+    body = "&".join(
+        f"{quote(k, safe='[]_')}={quote(str(v), safe='')}" for k, v in pairs
+    )
+    return body.encode("utf-8")
+
+
+def _classify_imoview_ajax_response(r: requests.Response) -> tuple[str, dict[str, Any] | None]:
+    if r.status_code != 200:
+        return f"{IMOVIEW_AJAX_PROBE_HTTP}:{r.status_code}", None
+    ct = (r.headers.get("content-type") or "").lower()
+    raw = (r.text or "").strip()
+    try:
+        if "json" in ct or raw.startswith("{"):
+            body = r.json()
+        else:
+            return f"{IMOVIEW_AJAX_PROBE_NOT_JSON}:{ct[:48]}", None
+    except json.JSONDecodeError:
+        return IMOVIEW_AJAX_PROBE_INVALID_JSON, None
+    if not isinstance(body, dict):
+        return IMOVIEW_AJAX_PROBE_SCHEMA, None
+    lista = body.get("lista")
+    if not isinstance(lista, list) or len(lista) < 1:
+        return IMOVIEW_AJAX_PROBE_EMPTY, body
+    row0 = lista[0]
+    if not isinstance(row0, dict) or row0.get("codigo") is None:
+        return IMOVIEW_AJAX_PROBE_SCHEMA, body
+    return IMOVIEW_AJAX_PROBE_OK, body
+
+
+def probe_imoview_imoveis_ajax(
+    session: requests.Session, listing_url: str
+) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "ok": False,
+        "probe_status": IMOVIEW_AJAX_PROBE_FAILED,
+        "http_status": None,
+    }
+    if not listing_url_signals_imoview_imoveis_ajax(listing_url):
+        out["probe_status"] = IMOVIEW_AJAX_PROBE_FAILED
+        return out
+    pu = urlparse(listing_url)
+    origin = f"{pu.scheme or 'https'}://{pu.netloc}"
+    ajax_url = urljoin(origin.rstrip("/") + "/", "imoveis/ajax/")
+    imovel_obj = _imoview_imovel_payload_from_listing_url(listing_url, page=1)
+    try:
+        r = session.post(
+            ajax_url,
+            data=_imoview_ajax_post_body(imovel_obj),
+            headers={
+                **HEADERS,
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Origin": origin,
+                "Referer": listing_url,
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests_exceptions.Timeout:
+        out["probe_status"] = f"{IMOVIEW_AJAX_PROBE_HTTP}:timeout"
+        return out
+    except requests_exceptions.RequestException:
+        out["probe_status"] = IMOVIEW_AJAX_PROBE_FAILED
+        return out
+    except OSError:
+        out["probe_status"] = IMOVIEW_AJAX_PROBE_FAILED
+        return out
+    out["http_status"] = r.status_code
+    st, body = _classify_imoview_ajax_response(r)
+    out["probe_status"] = st
+    if st == IMOVIEW_AJAX_PROBE_OK:
+        out["ok"] = True
+        qtd = body.get("quantidade") if isinstance(body, dict) else None
+        try:
+            out["quantidade_reported"] = int(str(qtd).strip()) if qtd is not None else None
+        except (TypeError, ValueError):
+            out["quantidade_reported"] = None
+    return out
+
+
+def _imovel_dict_from_imoview_ajax_row(
+    row: dict[str, Any], listing_url: str, site: dict
+) -> dict[str, Any] | None:
+    codigo = row.get("codigo")
+    titulo_slug = (row.get("titulo") or "").strip().strip("/")
+    if codigo is None or not titulo_slug:
+        return None
+    pu = urlparse(listing_url)
+    scheme = pu.scheme or "https"
+    origin = f"{scheme}://{pu.netloc}".rstrip("/")
+    codigo_str = str(codigo).strip()
+    detail = f"{origin}/imovel/{titulo_slug}/{codigo_str}"
+    desc = (row.get("descricao") or "").strip()
+    titulo_h = desc if desc else titulo_slug.replace("-", " ").strip() or "Imóvel"
+    preco_texto = (row.get("valor") or "").strip()
+    tipo_txt = (row.get("tipo") or "").strip()
+    fin = (row.get("finalidade") or "").strip().lower()
+    finalidade = "alugar" if "alug" in fin else "venda"
+    bairro = (row.get("bairro") or "").strip()[:120]
+    cidade = (row.get("cidade") or "").strip()[:120] or "Jaraguá do Sul"
+    endereco = (row.get("endereco") or "").strip()[:300]
+    area_m2 = None
+    ai = (row.get("areainterna") or "").strip()
+    if ai:
+        try:
+            area_m2 = float(str(ai).replace(".", "").replace(",", "."))
+        except ValueError:
+            area_m2 = None
+    quartos = None
+    nq = row.get("numeroquartos")
+    if nq is not None and str(nq).strip().isdigit():
+        quartos = int(str(nq).strip())
+    banheiros = None
+    nb = row.get("numerobanhos")
+    if nb is not None and str(nb).strip().isdigit():
+        banheiros = int(str(nb).strip())
+    vagas = None
+    nv = row.get("numerovagas")
+    if nv is not None and str(nv).strip().isdigit():
+        vagas = int(str(nv).strip())
+    foto = (row.get("urlfotoprincipalp") or row.get("urlfotoprincipalpp") or "").strip()
+
+    return {
+        "site_id": site["id"],
+        "site_name": site["name"],
+        "titulo": titulo_h[:200],
+        "tipo": detect_tipo(titulo_h + " " + tipo_txt),
+        "finalidade": finalidade,
+        "preco_texto": preco_texto,
+        "preco": parse_preco(preco_texto) if preco_texto else None,
+        "area_m2": area_m2,
+        "quartos": quartos,
+        "banheiros": banheiros,
+        "vagas": vagas,
+        "bairro": bairro,
+        "cidade": cidade,
+        "endereco": endereco,
+        "descricao": "",
+        "url_anuncio": detail,
+        "url_foto": foto[:500] if foto else "",
+        "codigo": codigo_str,
+    }
+
+
+def extract_imoveis_imoview_imoveis_ajax_api(
+    session: requests.Session,
+    listing_url: str,
+    site: dict,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    meta_out: dict[str, Any] = {
+        "pagination_pattern": "imoview_ajax_post_pagina",
+        "pages_fetched": 0,
+        "total_items": 0,
+        "detail_links": 0,
+        "validation_reason": "",
+        "last_error": "",
+        "stop_reason": "",
+        "quantidade_reported": None,
+        "ajax_url": "",
+    }
+    if not listing_url_signals_imoview_imoveis_ajax(listing_url):
+        meta_out["stop_reason"] = IMOVIEW_AJAX_PROBE_FAILED
+        meta_out["validation_reason"] = "url_not_imoview_pattern"
+        return [], meta_out
+    pu = urlparse(listing_url)
+    origin = f"{(pu.scheme or 'https')}://{pu.netloc}"
+    ajax_url = urljoin(origin.rstrip("/") + "/", "imoveis/ajax/")
+    meta_out["ajax_url"] = ajax_url
+
+    seen_codes: set[str] = set()
+    all_items: list[dict[str, Any]] = []
+    quantidade: int | None = None
+    page = 1
+
+    while page <= MAX_PAGES_PER_SITE:
+        imovel_obj = _imoview_imovel_payload_from_listing_url(listing_url, page=page)
+        try:
+            r = session.post(
+                ajax_url,
+                data=_imoview_ajax_post_body(imovel_obj),
+                headers={
+                    **HEADERS,
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Origin": origin,
+                    "Referer": listing_url,
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+            st, body = _classify_imoview_ajax_response(r)
+        except requests_exceptions.Timeout as e:
+            et, em = format_exception(e)
+            meta_out["last_error"] = f"{et}: {em}"
+            meta_out["stop_reason"] = IMOVIEW_AJAX_STOP_HTTP
+            break
+        except requests_exceptions.RequestException as e:
+            et, em = format_exception(e)
+            meta_out["last_error"] = f"{et}: {em}"
+            meta_out["stop_reason"] = IMOVIEW_AJAX_STOP_HTTP
+            break
+        except (json.JSONDecodeError, OSError) as e:
+            et, em = format_exception(e)
+            meta_out["last_error"] = f"{et}: {em}"
+            meta_out["stop_reason"] = IMOVIEW_AJAX_STOP_HTTP
+            break
+
+        if st != IMOVIEW_AJAX_PROBE_OK or not isinstance(body, dict):
+            meta_out["last_error"] = str(st)
+            meta_out["stop_reason"] = IMOVIEW_AJAX_STOP_HTTP if page == 1 else st
+            break
+
+        meta_out["pages_fetched"] = page
+        if quantidade is None and body.get("quantidade") is not None:
+            try:
+                quantidade = int(str(body.get("quantidade")).strip())
+            except (TypeError, ValueError):
+                quantidade = None
+            meta_out["quantidade_reported"] = quantidade
+
+        lista = body.get("lista")
+        if not isinstance(lista, list) or len(lista) == 0:
+            meta_out["stop_reason"] = (
+                IMOVIEW_AJAX_STOP_NO_NEW if all_items else IMOVIEW_AJAX_PROBE_EMPTY
+            )
+            break
+
+        new_n = 0
+        for row in lista:
+            if not isinstance(row, dict):
+                continue
+            c = str(row.get("codigo") or "").strip()
+            if not c or c in seen_codes:
+                continue
+            item = _imovel_dict_from_imoview_ajax_row(row, listing_url, site)
+            if not item:
+                continue
+            seen_codes.add(c)
+            all_items.append(item)
+            new_n += 1
+
+        if new_n == 0:
+            meta_out["stop_reason"] = IMOVIEW_AJAX_STOP_NO_NEW
+            break
+
+        if quantidade is not None and quantidade > 0 and len(all_items) >= quantidade:
+            meta_out["stop_reason"] = IMOVIEW_AJAX_STOP_TOTAL
+            break
+
+        if page >= MAX_PAGES_PER_SITE:
+            meta_out["stop_reason"] = IMOVIEW_AJAX_STOP_MAX_PAGES
+            break
+
+        page += 1
+
+    if not meta_out["stop_reason"] and all_items:
+        meta_out["stop_reason"] = IMOVIEW_AJAX_STOP_COMPLETED
+
+    meta_out["total_items"] = len(all_items)
+    meta_out["detail_links"] = sum(1 for x in all_items if x.get("url_anuncio"))
+    meta_out["validation_reason"] = (
+        "imoview_ajax_json_lista"
+        if all_items
+        else (meta_out.get("last_error") or "imoview_empty")
+    )
+
+    log.info(
+        "Imoview /imoveis/ajax/: %s — %s imóveis | páginas=%s | stop=%s | quantidade=%s",
+        site["name"],
+        meta_out["total_items"],
+        meta_out["pages_fetched"],
+        meta_out.get("stop_reason") or "?",
+        meta_out.get("quantidade_reported"),
+    )
+    return all_items, meta_out
+
+
+# ── PHP Sami-style — GET …/includes/vendas/acao-atualiza-imoveis.php?offset= (JSON.results HTML) ──
+PHP_ACAO_PROBE_OK = "php_acao_ok"
+PHP_ACAO_PROBE_HTTP = "php_acao_http"
+PHP_ACAO_PROBE_NOT_JSON = "php_acao_not_json"
+PHP_ACAO_PROBE_SCHEMA = "php_acao_schema"
+PHP_ACAO_PROBE_EMPTY = "php_acao_empty"
+PHP_ACAO_PROBE_FAILED = "php_acao_failed"
+
+PHP_ACAO_STOP_COMPLETED = "php_acao_completed"
+PHP_ACAO_STOP_NO_NEW = "php_acao_no_new"
+PHP_ACAO_STOP_HTTP = "php_acao_http_error"
+PHP_ACAO_STOP_MAX = "php_acao_max_offsets"
+
+
+def _listing_html_signals_php_acao_atualiza_imoveis(html: str) -> bool:
+    if not html:
+        return False
+    h = html.lower()
+    if "acao-atualiza-imoveis.php" in h:
+        return True
+    # Sami / CRM white-label: endpoint citado em JS externo; listagem traz grid + CDN mount.
+    if "grid-imoveis" in h and "samisistemas" in h:
+        return True
+    return False
+
+
+def listing_url_signals_php_acao_atualiza_candidate(listing_url: str) -> bool:
+    """URL típica de listagens que usam ``acao-atualiza-imoveis.php`` (Sami)."""
+    p = (urlparse(listing_url or "").path or "").lower()
+    return "imoveis-para-venda" in p or "imoveis-para-aluguel" in p
+
+
+def _php_acao_api_url(listing_url: str) -> str:
+    pu = urlparse(listing_url)
+    origin = f"{pu.scheme or 'https'}://{pu.netloc}"
+    return urljoin(origin.rstrip("/") + "/", "includes/vendas/acao-atualiza-imoveis.php")
+
+
+def probe_php_acao_atualiza_imoveis(
+    session: requests.Session, listing_url: str
+) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "ok": False,
+        "probe_status": PHP_ACAO_PROBE_FAILED,
+        "http_status": None,
+        "page_size_hint": 0,
+    }
+    api = _php_acao_api_url(listing_url)
+    try:
+        r = session.get(
+            api,
+            params={"offset": 0},
+            headers={
+                **HEADERS,
+                "Referer": listing_url,
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests_exceptions.RequestException:
+        out["probe_status"] = PHP_ACAO_PROBE_FAILED
+        return out
+    out["http_status"] = r.status_code
+    if r.status_code != 200:
+        out["probe_status"] = f"{PHP_ACAO_PROBE_HTTP}:{r.status_code}"
+        return out
+    try:
+        body = r.json()
+    except json.JSONDecodeError:
+        out["probe_status"] = PHP_ACAO_PROBE_NOT_JSON
+        return out
+    if not isinstance(body, dict) or "results" not in body:
+        out["probe_status"] = PHP_ACAO_PROBE_SCHEMA
+        return out
+    frag = body.get("results")
+    if not isinstance(frag, str) or not frag.strip():
+        out["probe_status"] = PHP_ACAO_PROBE_EMPTY
+        return out
+    soup = BeautifulSoup(frag, "html.parser")
+    n = len(soup.select("[data-imovel-id]"))
+    out["page_size_hint"] = n
+    if n < 1:
+        out["probe_status"] = PHP_ACAO_PROBE_EMPTY
+        return out
+    out["probe_status"] = PHP_ACAO_PROBE_OK
+    out["ok"] = True
+    return out
+
+
+def _imovel_dict_from_php_acao_card(
+    card, listing_url: str, site: dict
+) -> dict[str, Any] | None:
+    iid = (card.get("data-imovel-id") or "").strip()
+    if not iid:
+        return None
+    a = card.select_one('a[href*="detalhes-imovel"]')
+    if not a or not a.get("href"):
+        return None
+    detail = urljoin(listing_url, a["href"].strip())
+    tit_el = card.select_one("h2.product-title a, h2 a, .product-title a")
+    titulo = (tit_el.get_text(strip=True) if tit_el else "")[:200] or f"Imóvel {iid}"
+    tipo_el = card.select_one(".product-badge li")
+    tipo_txt = tipo_el.get_text(strip=True) if tipo_el else ""
+    text = card.get_text(" ", strip=True)
+    preco_texto = ""
+    m = re.search(r"R\$\s*[\d\.\s]+(?:,\d{2})?", text)
+    if m:
+        preco_texto = m.group(0).strip()
+    nums: list[int] = []
+    for span in card.select("ul.ltn__list-item-2--- li span, .ltn__plot-brief li span"):
+        t = span.get_text(strip=True)
+        if t.isdigit():
+            nums.append(int(t))
+    quartos = nums[0] if len(nums) > 0 else None
+    banheiros = nums[1] if len(nums) > 1 else None
+    vagas = nums[2] if len(nums) > 2 else None
+    img = card.select_one("img[src]")
+    foto = (img.get("src") or "").strip() if img else ""
+
+    return {
+        "site_id": site["id"],
+        "site_name": site["name"],
+        "titulo": titulo,
+        "tipo": detect_tipo(titulo + " " + tipo_txt),
+        "finalidade": "venda",
+        "preco_texto": preco_texto,
+        "preco": parse_preco(preco_texto) if preco_texto else None,
+        "area_m2": None,
+        "quartos": quartos,
+        "banheiros": banheiros,
+        "vagas": vagas,
+        "bairro": "",
+        "cidade": "",
+        "endereco": "",
+        "descricao": "",
+        "url_anuncio": detail,
+        "url_foto": foto[:500] if foto else "",
+        "codigo": iid,
+    }
+
+
+def extract_imoveis_php_acao_atualiza_imoveis(
+    session: requests.Session,
+    listing_url: str,
+    site: dict,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    meta_out: dict[str, Any] = {
+        "pagination_pattern": "php_acao_offset",
+        "offsets_fetched": 0,
+        "total_items": 0,
+        "detail_links": 0,
+        "validation_reason": "",
+        "last_error": "",
+        "stop_reason": "",
+        "offset_step": 0,
+        "api_url": _php_acao_api_url(listing_url),
+    }
+    api = meta_out["api_url"]
+    seen_ids: set[str] = set()
+    all_items: list[dict[str, Any]] = []
+    offset = 0
+    step = 0
+    max_rounds = MAX_PAGES_PER_SITE
+
+    for _ in range(max_rounds):
+        try:
+            r = session.get(
+                api,
+                params={"offset": offset},
+                headers={
+                    **HEADERS,
+                    "Referer": listing_url,
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+            r.raise_for_status()
+            body = r.json()
+        except requests_exceptions.RequestException as e:
+            et, em = format_exception(e)
+            meta_out["last_error"] = f"{et}: {em}"
+            meta_out["stop_reason"] = PHP_ACAO_STOP_HTTP
+            break
+        except (json.JSONDecodeError, OSError) as e:
+            et, em = format_exception(e)
+            meta_out["last_error"] = f"{et}: {em}"
+            meta_out["stop_reason"] = PHP_ACAO_STOP_HTTP
+            break
+
+        if not isinstance(body, dict):
+            meta_out["stop_reason"] = PHP_ACAO_PROBE_SCHEMA
+            break
+        frag = body.get("results")
+        if not isinstance(frag, str) or not frag.strip():
+            if offset == 0:
+                meta_out["stop_reason"] = PHP_ACAO_PROBE_EMPTY
+            else:
+                meta_out["stop_reason"] = PHP_ACAO_STOP_COMPLETED
+            break
+
+        soup = BeautifulSoup(frag, "html.parser")
+        cards = soup.select("[data-imovel-id]")
+        meta_out["offsets_fetched"] = offset
+        if not cards:
+            meta_out["stop_reason"] = PHP_ACAO_STOP_NO_NEW if all_items else PHP_ACAO_PROBE_EMPTY
+            break
+
+        if step == 0:
+            step = len(cards)
+            if step < 1:
+                step = 15
+            meta_out["offset_step"] = step
+
+        new_n = 0
+        for card in cards:
+            iid = (card.get("data-imovel-id") or "").strip()
+            if not iid or iid in seen_ids:
+                continue
+            item = _imovel_dict_from_php_acao_card(card, listing_url, site)
+            if not item:
+                continue
+            seen_ids.add(iid)
+            all_items.append(item)
+            new_n += 1
+
+        if new_n == 0:
+            meta_out["stop_reason"] = PHP_ACAO_STOP_NO_NEW
+            break
+
+        offset += step
+
+    if not meta_out["stop_reason"] and all_items:
+        meta_out["stop_reason"] = PHP_ACAO_STOP_COMPLETED
+
+    meta_out["total_items"] = len(all_items)
+    meta_out["detail_links"] = sum(1 for x in all_items if x.get("url_anuncio"))
+    meta_out["validation_reason"] = (
+        "php_acao_json_results_html"
+        if all_items
+        else (meta_out.get("last_error") or "php_acao_empty")
+    )
+
+    log.info(
+        "PHP acao-atualiza-imoveis: %s — %s imóveis | último offset=%s | step=%s | stop=%s",
+        site["name"],
+        meta_out["total_items"],
+        meta_out["offsets_fetched"],
+        meta_out.get("offset_step") or 0,
+        meta_out.get("stop_reason") or "?",
+    )
+    return all_items, meta_out
+
+
 def _register_api_first_families() -> None:
     """Registro tardio: evita NameError na definição da função."""
     API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_GERENCIAR_IMOVEIS_CF] = extract_imoveis_gerenciar_imoveis_cf_api
     API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_APREME_PLAYWRIGHT] = extract_imoveis_apreme_playwright
     API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_LOFT_PLAYWRIGHT] = extract_imoveis_loft_playwright
+    API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_IMOVIEW_IMOVEIS_AJAX] = extract_imoveis_imoview_imoveis_ajax_api
+    API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_PHP_ACAO_ATUALIZA_IMOVEIS] = (
+        extract_imoveis_php_acao_atualiza_imoveis
+    )
 
 
 _register_api_first_families()
@@ -2648,6 +3366,10 @@ def dispatch_api_first_family_extract(
         return extract_imoveis_apreme_playwright(site)
     if family == PLATFORM_FAMILY_LOFT_PLAYWRIGHT:
         return extract_imoveis_loft_playwright(site)
+    if family == PLATFORM_FAMILY_IMOVIEW_IMOVEIS_AJAX:
+        return extract_imoveis_imoview_imoveis_ajax_api(session, listing_url, site)
+    if family == PLATFORM_FAMILY_PHP_ACAO_ATUALIZA_IMOVEIS:
+        return extract_imoveis_php_acao_atualiza_imoveis(session, listing_url, site)
     return None
 
 
@@ -5179,6 +5901,58 @@ def scrape_site(
                     summary.notes.append(
                         json.dumps(
                             {"vista_web_busca_api": api_meta, "family_detection": fam_diag},
+                            ensure_ascii=False,
+                        )
+                    )
+                elif plat_fam == PLATFORM_FAMILY_IMOVIEW_IMOVEIS_AJAX:
+                    _pair = dispatch_api_first_family_extract(
+                        PLATFORM_FAMILY_IMOVIEW_IMOVEIS_AJAX,
+                        session,
+                        url_final,
+                        site,
+                    )
+                    imoveis_pagina, api_meta = (
+                        _pair if _pair is not None else ([], {"validation_reason": "dispatch_returned_none"})
+                    )
+                    used_api_first_listing = True
+                    summary.family_specific_extractor_used = True
+                    summary.family_card_count = int(api_meta.get("total_items") or 0)
+                    summary.family_detail_links_count = int(api_meta.get("detail_links") or 0)
+                    summary.family_pagination_pattern_detected = str(
+                        api_meta.get("pagination_pattern") or ""
+                    )
+                    summary.family_listing_validation_reason = str(
+                        api_meta.get("validation_reason") or ""
+                    )
+                    summary.notes.append(
+                        json.dumps(
+                            {"imoview_imoveis_ajax_api": api_meta, "family_detection": fam_diag},
+                            ensure_ascii=False,
+                        )
+                    )
+                elif plat_fam == PLATFORM_FAMILY_PHP_ACAO_ATUALIZA_IMOVEIS:
+                    _pair = dispatch_api_first_family_extract(
+                        PLATFORM_FAMILY_PHP_ACAO_ATUALIZA_IMOVEIS,
+                        session,
+                        url_final,
+                        site,
+                    )
+                    imoveis_pagina, api_meta = (
+                        _pair if _pair is not None else ([], {"validation_reason": "dispatch_returned_none"})
+                    )
+                    used_api_first_listing = True
+                    summary.family_specific_extractor_used = True
+                    summary.family_card_count = int(api_meta.get("total_items") or 0)
+                    summary.family_detail_links_count = int(api_meta.get("detail_links") or 0)
+                    summary.family_pagination_pattern_detected = str(
+                        api_meta.get("pagination_pattern") or ""
+                    )
+                    summary.family_listing_validation_reason = str(
+                        api_meta.get("validation_reason") or ""
+                    )
+                    summary.notes.append(
+                        json.dumps(
+                            {"php_acao_atualiza_imoveis_api": api_meta, "family_detection": fam_diag},
                             ensure_ascii=False,
                         )
                     )
