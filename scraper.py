@@ -1623,12 +1623,24 @@ def _extract_imoveis_generic_main(html: str, base_url: str, site: dict) -> list[
 
     for tag in soup.select("nav, footer, header, script, style, .menu, #menu"):
         tag.decompose()
+    html_work = str(soup)
 
-    sistema = detect_sistema(html, base_url)
+    found = extract_imoveis_li_imovel_div(html_work, base_url, site)
+    if found:
+        return found
+
+    found = extract_imoveis_detalhes_vd_box_lista(html_work, base_url, site)
+    if found:
+        return found
+
+    sistema = detect_sistema(html_work, base_url)
 
     if sistema == "apreme":
-        return extract_imoveis_apreme(html, base_url, site)
+        ap = extract_imoveis_apreme(html_work, base_url, site)
+        if ap:
+            return ap
 
+    soup = BeautifulSoup(html_work, "html.parser")
     card_selectors = {
         "jetimob":    [".property-card", ".imovel-card", "[class*='property']"],
         "kenlo":      [".result-item", ".listing-item", "[class*='listing']"],
@@ -2291,6 +2303,216 @@ def find_imovel_links(soup, base_url):
     return cards[:50]
 
 
+# Fragmentos de path que não são página de imóvel (mesmo host).
+_LI_IMOVEL_DETAIL_SKIP_PATH_FRAGMENTS = (
+    "contato",
+    "cadastre",
+    "cadastro",
+    "solicite",
+    "whatsapp",
+    "facebook",
+    "instagram",
+    "blog",
+    "trabalhe",
+    "politica",
+    "privacidade",
+    "cookie",
+    "login",
+    "anuncie",
+    "sobre",
+    "documento",
+)
+
+
+def _pick_li_imovel_detail_href(card, base_url: str) -> str:
+    """Primeiro link plausível de detalhe dentro de um ``div.LI_Imovel``."""
+    base_host = (urlparse(base_url).netloc or "").lower().replace("www.", "")
+    preferred: list[str] = []
+    fallback: list[str] = []
+    for a in card.find_all("a", href=True):
+        raw = (a.get("href") or "").strip()
+        if not raw or raw.startswith("#") or raw.lower().startswith("javascript:"):
+            continue
+        full = urljoin(base_url, raw.split("#")[0])
+        pu = urlparse(full)
+        host = (pu.netloc or "").lower().replace("www.", "")
+        if host and host != base_host:
+            continue
+        path = (pu.path or "").lower()
+        if any(frag in path for frag in _LI_IMOVEL_DETAIL_SKIP_PATH_FRAGMENTS):
+            continue
+        segs = [x for x in pu.path.split("/") if x]
+        if (
+            len(segs) == 2
+            and segs[0].lower() == "imoveis"
+            and segs[1].lower() in ("venda", "aluguel", "locacao", "locação", "temporada")
+        ):
+            continue
+        if re.search(r"-ref-\d+", path, re.I):
+            preferred.append(full)
+        else:
+            fallback.append(full)
+    if preferred:
+        return preferred[0]
+    return fallback[0] if fallback else ""
+
+
+def extract_imoveis_li_imovel_div(html: str, base_url: str, site: dict) -> list[dict]:
+    """
+    Família “Vista Web” / CRM comum no Brasil: cards ``div.LI_Imovel``, detalhe em slug
+    (muitas vezes ``...-ref-123``). Vários domínios distintos reutilizam o mesmo HTML.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    cards = soup.select("div.LI_Imovel")
+    cards = [c for c in cards if len(c.get_text(strip=True)) >= 40]
+    if len(cards) < 3:
+        return []
+
+    results: list[dict] = []
+    seen_url: set[str] = set()
+    for card in cards[:80]:
+        url_anuncio = _pick_li_imovel_detail_href(card, base_url)
+        if not url_anuncio or url_anuncio in seen_url:
+            continue
+        seen_url.add(url_anuncio)
+
+        text = card.get_text(" ", strip=True)
+        titulo = ""
+        for sel in ("h2", "h3", "h4", "h5", "h6"):
+            el = card.find(sel)
+            if el and el.get_text(strip=True):
+                titulo = el.get_text(strip=True)[:200]
+                break
+        if not titulo:
+            titulo = (text[:120] if text else "Imóvel")[:200]
+
+        preco_texto = ""
+        m = re.search(r"R\$\s*[\d.,]+", text)
+        if m:
+            preco_texto = m.group()
+
+        path = urlparse(url_anuncio).path or ""
+        codigo = ""
+        mref = re.search(r"-ref-(\d+)", path, re.I)
+        if mref:
+            codigo = mref.group(1)
+        if not codigo:
+            mref = re.search(r"\bREF\s*[:\s]*(\d+)\b", text, re.I)
+            if mref:
+                codigo = mref.group(1)
+
+        url_foto = ""
+        img = card.find("img")
+        if img:
+            src = img.get("src") or img.get("data-src") or img.get("data-lazy") or ""
+            if src and not src.startswith("data:"):
+                url_foto = urljoin(base_url, src)
+
+        bairro = ""
+        for sel in ("[class*='bairro']", "[class*='location']", "[class*='endereco']"):
+            el = card.select_one(sel)
+            if el and el.get_text(strip=True):
+                bairro = el.get_text(strip=True)[:100]
+                break
+
+        results.append(
+            {
+                "site_id": site["id"],
+                "site_name": site["name"],
+                "titulo": titulo,
+                "tipo": detect_tipo(titulo + " " + text[:200]),
+                "finalidade": "venda",
+                "preco_texto": preco_texto,
+                "preco": parse_preco(preco_texto),
+                "area_m2": None,
+                "quartos": None,
+                "banheiros": None,
+                "vagas": None,
+                "bairro": bairro,
+                "cidade": "Jaraguá do Sul",
+                "endereco": "",
+                "descricao": "",
+                "url_anuncio": url_anuncio,
+                "url_foto": url_foto,
+                "codigo": codigo,
+            }
+        )
+
+    return results
+
+
+def extract_imoveis_detalhes_vd_box_lista(html: str, base_url: str, site: dict) -> list[dict]:
+    """
+    PHP clássico: cards ``div.box_lista`` com link ``detalhes_vd.php?imovel=…``.
+    Template compartilhado por algumas imobiliárias independentes.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    boxes = soup.select("div.box_lista")
+    results: list[dict] = []
+    seen_codes: set[str] = set()
+    for box in boxes:
+        a = box.find("a", href=re.compile(r"detalhes_vd\.php", re.I))
+        if not a or not a.get("href"):
+            continue
+        full = urljoin(base_url, (a.get("href") or "").strip())
+        m_im = re.search(r"[?&]imovel=(\d+)", full, re.I)
+        if not m_im:
+            continue
+        codigo = m_im.group(1)
+        if codigo in seen_codes:
+            continue
+        seen_codes.add(codigo)
+
+        text = box.get_text(" ", strip=True)
+        titulo = ""
+        for sel in ("h2", "h3", "h4", "h5"):
+            el = box.find(sel)
+            if el and el.get_text(strip=True):
+                titulo = el.get_text(strip=True)[:200]
+                break
+        if not titulo:
+            titulo = a.get_text(strip=True)[:200] or f"Imóvel código {codigo}"
+
+        preco_texto = ""
+        m = re.search(r"R\$\s*[\d.,]+", text)
+        if m:
+            preco_texto = m.group()
+
+        url_foto = ""
+        img = box.find("img")
+        if img:
+            src = img.get("src") or img.get("data-src") or ""
+            if src and not src.startswith("data:"):
+                url_foto = urljoin(base_url, src)
+
+        results.append(
+            {
+                "site_id": site["id"],
+                "site_name": site["name"],
+                "titulo": titulo[:200],
+                "tipo": detect_tipo(titulo + " " + text[:200]),
+                "finalidade": "venda",
+                "preco_texto": preco_texto,
+                "preco": parse_preco(preco_texto),
+                "area_m2": None,
+                "quartos": None,
+                "banheiros": None,
+                "vagas": None,
+                "bairro": "",
+                "cidade": "Jaraguá do Sul",
+                "endereco": "",
+                "descricao": "",
+                "url_anuncio": full.split("#")[0],
+                "url_foto": url_foto,
+                "codigo": codigo,
+            }
+        )
+
+    if len(results) < 3:
+        return []
+    return results
+
+
 def extract_from_card(card, base_url: str, site: dict) -> dict:
     """Extrai campos estruturados de um card HTML."""
     text = card.get_text(" ", strip=True)
@@ -2934,6 +3156,24 @@ def has_more_results(
                 return True
         else:
             return True
+
+    # Vista Web (``div.LI_Imovel``): cards no HTML, paginação normalmente hidratada por JS —
+    # não usar só ``imoveis_count > 0`` como sinal de próxima página.
+    if listing_url:
+        if len(soup.select("div.LI_Imovel")) >= 2 and not html_listing_has_actionable_pagination(
+            html, listing_url
+        ):
+            return False
+
+    # PHP ``detalhes_vd.php`` em ``div.box_lista``: uma página “cheia” sem href de próxima no HTML.
+    if listing_url:
+        vd_cards = sum(
+            1
+            for b in soup.select("div.box_lista")
+            if b.find("a", href=re.compile(r"detalhes_vd\.php", re.I))
+        )
+        if vd_cards >= 3 and not html_listing_has_actionable_pagination(html, listing_url):
+            return False
 
     return imoveis_count > 0
 
