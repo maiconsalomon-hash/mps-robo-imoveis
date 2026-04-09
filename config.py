@@ -107,3 +107,8 @@ SYNC_INCREMENTAL_FULL_THRESHOLD_PCT = max(1, min(100, _env_int("SYNC_INCREMENTAL
 ROBOT_API_KEY = _env_str("ROBOT_API_KEY", "123") or "123"
 API_PORT = _env_int("API_PORT", 8000)
 API_HOST = _env_str("API_HOST", "0.0.0.0") or "0.0.0.0"
+
+# Playwright (sites com listagem via JS — scraper.py)
+PLAYWRIGHT_ENABLED = _env_bool("PLAYWRIGHT_ENABLED", True)
+PLAYWRIGHT_MAX_CONCURRENT = max(1, _env_int("PLAYWRIGHT_MAX_CONCURRENT", 1))
+PLAYWRIGHT_TIMEOUT = max(5000, _env_int("PLAYWRIGHT_TIMEOUT", 30000))

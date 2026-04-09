@@ -18,8 +18,9 @@ Credenciais: copie .env.example para .env (veja README). Variáveis sensíveis e
 Perfis de extração: ``site_profiles.json`` + tabela ``site_scrape_profiles`` no SQLite
 (veja refresh_site_profiles). Novos sites no mesmo “tema” recebem a chave do extrator sem
 alterar código, desde que exista em EXTRACTOR_REGISTRY — ex.: ``imonov_webflow`` (Morada /
-Webflow), ``apreme`` (Apre.me / links ``/12345`` ou ``/imovel/…``). Itaivan usa ramo próprio
-(``extract_imoveis_itaivan`` + Playwright), não o mapa por host.
+Webflow), ``apreme`` (Apre.me / links ``/12345`` ou ``/imovel/…``). Itaivan e os hosts
+``PLAYWRIGHT_APRE_HOSTS`` / ``PLAYWRIGHT_LOFT_HOSTS`` usam Playwright quando
+``PLAYWRIGHT_ENABLED`` (variáveis em ``config.py``).
 Sites Next.js da família Tecimob / Gerenciar Imóveis CF (URLs ``/comprar/imoveis`` ou
 ``/comprar-alugar/imoveis`` com ``offset`` + ``limit``) são detectados por
 ``detect_platform_family`` e coletados pela API pública com header ``x-domain``, sem depender
@@ -36,10 +37,12 @@ import sys
 import argparse
 import hashlib
 import logging
+import threading
+import contextlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 import requests
 from requests import exceptions as requests_exceptions
@@ -49,6 +52,7 @@ try:
     from playwright.sync_api import sync_playwright as _sync_playwright
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
+    _sync_playwright = None  # type: ignore[misc, assignment]
     PLAYWRIGHT_AVAILABLE = False
 
 from pagination_cutoff import (  # noqa: E402
@@ -69,6 +73,9 @@ from pagination_guard import (  # noqa: E402
 )
 from config import (  # noqa: E402 — .env antes do restante da execução
     ANTHROPIC_API_KEY,
+    PLAYWRIGHT_ENABLED,
+    PLAYWRIGHT_MAX_CONCURRENT,
+    PLAYWRIGHT_TIMEOUT,
     RETRY_DELAY_SECONDS,
     RETRY_ENABLED,
     RETRY_ERRORS_ELIGIBLE,
@@ -87,6 +94,9 @@ from config import (  # noqa: E402 — .env antes do restante da execução
     SYNC_MIN_DATA_QUALITY_SCORE,
 )
 from round_lock import try_acquire_round_lock  # noqa: E402 — MINI-ETAPA 7A
+
+PLAYWRIGHT_TIMEOUT_MS = int(PLAYWRIGHT_TIMEOUT)
+_PLAYWRIGHT_SLOT = threading.Semaphore(max(1, int(PLAYWRIGHT_MAX_CONCURRENT)))
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -246,6 +256,23 @@ SITES = [
     {"id": 52, "name": "girolla.com.br",                "url": "https://girolla.com.br/busca?finalidade=Venda"},
     {"id": 53, "name": "imoveisplaneta.com.br",         "url": "https://www.imoveisplaneta.com.br/imoveis?pretensao=comprar&pagina=1"},
 ]
+
+# Hosts cuja listagem depende de JS (Playwright). ``www.`` é normalizado em ``_normalized_listing_host``.
+PLAYWRIGHT_APRE_HOSTS = frozenset(
+    {
+        "d2imoveis.com",
+        "imobimobiliariasc.com.br",
+        "macroimoveis.com",
+    }
+)
+PLAYWRIGHT_LOFT_HOSTS = frozenset(
+    {
+        "vivendaimoveis.com",
+        "chaleimobiliaria.com.br",
+        "imoveiscidade.com.br",
+        "girolla.com.br",
+    }
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1055,6 +1082,376 @@ def _is_itaivan_detail_href(href: str) -> bool:
     return bool(_ITAIVAN_DETAIL_RE.match(path))
 
 
+def _normalized_listing_host(listing_url: str) -> str:
+    raw = (urlparse(listing_url).netloc or "").lower().strip()
+    return raw[4:] if raw.startswith("www.") else raw
+
+
+@contextlib.contextmanager
+def playwright_browser_page():
+    """
+    Garante no máximo ``PLAYWRIGHT_MAX_CONCURRENT`` browsers ao mesmo tempo e fecha
+    contexto + browser ao sair (Railway / memória).
+    """
+    if not PLAYWRIGHT_ENABLED:
+        yield None
+        return
+    if not PLAYWRIGHT_AVAILABLE or _sync_playwright is None:
+        yield None
+        return
+    _PLAYWRIGHT_SLOT.acquire()
+    try:
+        with _sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = browser.new_context(
+                user_agent=HEADERS["User-Agent"],
+                locale="pt-BR",
+            )
+            page = context.new_page()
+            page.set_default_timeout(PLAYWRIGHT_TIMEOUT_MS)
+            try:
+                yield page
+            finally:
+                context.close()
+                browser.close()
+    finally:
+        _PLAYWRIGHT_SLOT.release()
+
+
+def _playwright_dismiss_cookies(page: Any) -> None:
+    for loc in (
+        page.get_by_role("button", name=re.compile(r"entendi|aceito|ok|concordo|aceitar", re.I)),
+        page.locator(".cc-btn"),
+    ):
+        if loc.count():
+            try:
+                loc.first.click(timeout=3000)
+                page.wait_for_timeout(500)
+            except Exception:
+                pass
+            break
+
+
+def _playwright_goto_listing(page: Any, url: str) -> None:
+    page.goto(
+        url,
+        wait_until="domcontentloaded",
+        timeout=max(PLAYWRIGHT_TIMEOUT_MS * 2, 60000),
+    )
+    try:
+        page.wait_for_load_state("networkidle", timeout=min(25000, PLAYWRIGHT_TIMEOUT_MS + 5000))
+    except Exception:
+        pass
+    page.wait_for_timeout(2000)
+
+
+def extract_imoveis_apreme_playwright(site: dict) -> tuple[list[dict], dict]:
+    """
+    Apre.me com listagem renderizada no cliente: extrai via ``extract_imoveis_apreme`` no HTML
+    renderizado e acumula páginas com botões estilo «Mostrar mais» / «Carregar mais».
+    """
+    meta: dict[str, Any] = {
+        "pages_attempted": 0,
+        "pages_succeeded": 0,
+        "playwright_error_type": None,
+        "playwright_error_message": None,
+        "load_more_clicks": 0,
+        "stop_reason": "",
+        "render_fallback": False,
+    }
+    if not PLAYWRIGHT_ENABLED:
+        log.warning(
+            "    %s: PLAYWRIGHT_ENABLED=false — listagem JS não será renderizada.",
+            site.get("name", "?"),
+        )
+        meta["render_fallback"] = True
+        meta["stop_reason"] = "playwright_disabled"
+        return [], meta
+    if not PLAYWRIGHT_AVAILABLE:
+        log.warning(
+            "    %s: Playwright não instalado — defina PLAYWRIGHT_ENABLED=false ou instale browsers.",
+            site.get("name", "?"),
+        )
+        meta["render_fallback"] = True
+        meta["stop_reason"] = "playwright_unavailable"
+        return [], meta
+
+    listing = (site.get("url") or "").strip()
+    if not listing:
+        meta["playwright_error_type"] = "InvalidArgument"
+        meta["playwright_error_message"] = "URL de listagem vazia"
+        return [], meta
+
+    all_items: list[dict] = []
+    seen_codes: set[str] = set()
+    log.info("    %s: Playwright (Apre.me) — %s", site["name"], listing[:88])
+
+    try:
+        with playwright_browser_page() as page:
+            if page is None:
+                meta["render_fallback"] = True
+                meta["stop_reason"] = "playwright_slot_unavailable"
+                return [], meta
+            _playwright_goto_listing(page, listing)
+            _playwright_dismiss_cookies(page)
+
+            stagnant_rounds = 0
+            max_apre_rounds = max(120, ITAIVAN_MAX_PAGES, MAX_PAGES_PER_SITE)
+            while meta["pages_attempted"] < max_apre_rounds:
+                meta["pages_attempted"] += 1
+                html = page.content()
+                batch = extract_imoveis_apreme(html, page.url, site)
+                n_before = len(seen_codes)
+                for im in batch:
+                    c = str(im.get("codigo") or "").strip()
+                    if not c:
+                        continue
+                    if c in seen_codes:
+                        continue
+                    seen_codes.add(c)
+                    all_items.append(im)
+                if len(seen_codes) > n_before:
+                    meta["pages_succeeded"] += 1
+                    stagnant_rounds = 0
+                else:
+                    stagnant_rounds += 1
+
+                more = page.get_by_text(
+                    re.compile(r"Mostrar mais|Carregar mais|Ver mais imóveis", re.I)
+                )
+                if more.count() == 0:
+                    meta["stop_reason"] = "no_load_more_control"
+                    break
+                prev = len(seen_codes)
+                try:
+                    more.first.click(timeout=min(8000, PLAYWRIGHT_TIMEOUT_MS))
+                except Exception:
+                    meta["stop_reason"] = "load_more_click_failed"
+                    break
+                meta["load_more_clicks"] += 1
+                page.wait_for_timeout(2200)
+                if len(seen_codes) == prev:
+                    stagnant_rounds += 1
+                if stagnant_rounds >= 2:
+                    meta["stop_reason"] = "no_new_items_after_load_more"
+                    break
+
+    except Exception as e:
+        et, em = format_exception(e)
+        meta["playwright_error_type"] = et
+        meta["playwright_error_message"] = em
+        log.error("    %s Playwright (Apre.me): erro [%s] — %s", site["name"], et, em)
+        return all_items, meta
+
+    if not meta["stop_reason"]:
+        meta["stop_reason"] = "completed_or_capped"
+    log.info("    %s Playwright (Apre.me): total = %s imóveis", site["name"], len(all_items))
+    return all_items, meta
+
+
+def _loft_listing_url_with_page(listing_url: str, page_idx: int) -> str:
+    pu = urlparse(listing_url)
+    qs = parse_qs(pu.query, keep_blank_values=True)
+    qs["page"] = [str(page_idx)]
+    return urlunparse(pu._replace(query=urlencode(qs, doseq=True)))
+
+
+def _extract_loft_cards_from_html(html: str, base_url: str, site: dict) -> list[dict]:
+    """Cards a partir de links ``/imovel/`` no DOM (Next.js / Loft)."""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.select("nav, footer, header, script, style"):
+        tag.decompose()
+
+    domain = (urlparse(base_url).netloc or "").lower()
+    results: list[dict] = []
+    seen_urls: set[str] = set()
+
+    for a in soup.select('a[href*="/imovel/"]'):
+        href_raw = (a.get("href") or "").strip()
+        if not href_raw or href_raw.startswith("#"):
+            continue
+        href = href_raw.split("#")[0]
+        full = urljoin(base_url, href)
+        pu = urlparse(full)
+        host = (pu.netloc or "").lower()
+        if host and host not in domain and domain not in host:
+            continue
+        if full in seen_urls:
+            continue
+        seen_urls.add(full)
+
+        path_tail = pu.path.rstrip("/").split("/")[-1]
+        codigo = path_tail or ""
+
+        titulo = a.get_text(strip=True)[:200]
+        card = a.parent
+        prev = card
+        for _ in range(12):
+            if card is None:
+                card = prev
+                break
+            t = card.get_text(" ", strip=True)
+            if len(t) >= 40:
+                break
+            prev = card
+            card = card.parent
+        if card and len(card.get_text(" ", strip=True)) > 2000:
+            card = prev if prev else a.parent
+        text = (card.get_text(" ", strip=True) if card else "") or ""
+
+        if not titulo or len(titulo) < 4:
+            titulo = path_tail.replace("-", " ").title()[:200] if path_tail else "Imóvel"
+
+        preco_texto, preco = "", None
+        m = re.search(r"R\$\s*[\d.,]+", text)
+        if m:
+            preco_texto = m.group()
+            preco = parse_preco(preco_texto)
+
+        quartos = banheiros = vagas = None
+        m = re.search(
+            r"(\d+)\s*(?:Dormitório|dormitório|Quarto|quarto|Suíte|Suite)", text
+        )
+        if m:
+            quartos = int(m.group(1))
+        m = re.search(r"(\d+)\s*(?:~\s*\d+\s*)?Banheiro", text, re.I)
+        if m:
+            banheiros = int(m.group(1))
+        m = re.search(r"(\d+)\s*Vaga", text, re.I)
+        if m:
+            vagas = int(m.group(1))
+
+        area_m2 = None
+        m = re.search(r"Privativo:\s*([\d.,]+)\s*m", text, re.I)
+        if m:
+            area_m2 = float(m.group(1).replace(",", "."))
+        else:
+            m = re.search(r"(\d+[\.,]?\d*)\s*m[²2]", text)
+            if m:
+                area_m2 = parse_area(m.group())
+
+        bairro, cidade = "", "Jaraguá do Sul"
+        m = re.search(
+            r"([A-ZÀ-Ú][^\d,]{2,30}),\s*(Jaraguá do Sul|Guaramirim|Schroeder|Penha|Joinville|Pomerode)",
+            text,
+        )
+        if m:
+            bairro = m.group(1).strip()
+            cidade = m.group(2).strip()
+
+        url_foto = ""
+        img = card.find("img") if card else None
+        if img:
+            src = img.get("src") or img.get("data-src") or ""
+            if src and not src.startswith("data:"):
+                url_foto = src if src.startswith("http") else urljoin(base_url, src)
+
+        ql = (base_url or "").lower()
+        finalidade = "alugar" if ("alug" in ql or "locaç" in ql or "locacao" in ql) else "venda"
+
+        results.append(
+            {
+                "site_id": site["id"],
+                "site_name": site["name"],
+                "titulo": titulo[:200],
+                "tipo": detect_tipo(titulo + " " + text[:240]),
+                "finalidade": finalidade,
+                "preco_texto": preco_texto,
+                "preco": preco,
+                "area_m2": area_m2,
+                "quartos": quartos,
+                "banheiros": banheiros,
+                "vagas": vagas,
+                "bairro": bairro,
+                "cidade": cidade,
+                "url_anuncio": full,
+                "url_foto": url_foto,
+                "codigo": codigo,
+            }
+        )
+
+    return results
+
+
+def extract_imoveis_loft_playwright(site: dict) -> tuple[list[dict], dict]:
+    """Sites Loft (Next): paginação ``?page=`` + links ``/imovel/`` no HTML hidratado."""
+    meta: dict[str, Any] = {
+        "pages_attempted": 0,
+        "pages_succeeded": 0,
+        "playwright_error_type": None,
+        "playwright_error_message": None,
+        "stop_reason": "",
+        "render_fallback": False,
+    }
+    if not PLAYWRIGHT_ENABLED:
+        log.warning(
+            "    %s: PLAYWRIGHT_ENABLED=false — listagem JS não será renderizada.",
+            site.get("name", "?"),
+        )
+        meta["render_fallback"] = True
+        meta["stop_reason"] = "playwright_disabled"
+        return [], meta
+    if not PLAYWRIGHT_AVAILABLE:
+        log.warning(
+            "    %s: Playwright não instalado — defina PLAYWRIGHT_ENABLED=false ou instale browsers.",
+            site.get("name", "?"),
+        )
+        meta["render_fallback"] = True
+        meta["stop_reason"] = "playwright_unavailable"
+        return [], meta
+
+    listing = (site.get("url") or "").strip()
+    if not listing:
+        meta["playwright_error_type"] = "InvalidArgument"
+        meta["playwright_error_message"] = "URL de listagem vazia"
+        return [], meta
+
+    all_items: list[dict] = []
+    seen_urls: set[str] = set()
+    log.info("    %s: Playwright (Loft) — %s", site["name"], listing[:88])
+
+    try:
+        with playwright_browser_page() as page:
+            if page is None:
+                meta["render_fallback"] = True
+                meta["stop_reason"] = "playwright_slot_unavailable"
+                return [], meta
+            _playwright_dismiss_cookies(page)
+
+            for page_idx in range(1, MAX_PAGES_PER_SITE + 1):
+                meta["pages_attempted"] += 1
+                url_page = _loft_listing_url_with_page(listing, page_idx)
+                _playwright_goto_listing(page, url_page)
+                batch = _extract_loft_cards_from_html(page.content(), page.url, site)
+                n_new = 0
+                for im in batch:
+                    u = (im.get("url_anuncio") or "").strip()
+                    if not u or u in seen_urls:
+                        continue
+                    seen_urls.add(u)
+                    all_items.append(im)
+                    n_new += 1
+                if n_new == 0:
+                    meta["stop_reason"] = "no_new_items" if page_idx > 1 else "empty_first_page"
+                    break
+                meta["pages_succeeded"] += 1
+
+    except Exception as e:
+        et, em = format_exception(e)
+        meta["playwright_error_type"] = et
+        meta["playwright_error_message"] = em
+        log.error("    %s Playwright (Loft): erro [%s] — %s", site["name"], et, em)
+        return all_items, meta
+
+    if not meta["stop_reason"]:
+        meta["stop_reason"] = "completed_or_capped"
+    log.info("    %s Playwright (Loft): total = %s imóveis", site["name"], len(all_items))
+    return all_items, meta
+
+
 def scrape_itaivan_playwright(site: dict, max_pages: int | None = None) -> tuple[list[dict], dict]:
     """
     Scraper dedicado para Itaivan usando Playwright (site renderizado por JS).
@@ -1070,6 +1467,11 @@ def scrape_itaivan_playwright(site: dict, max_pages: int | None = None) -> tuple
 
     if max_pages is None:
         max_pages = max(MAX_PAGES_PER_SITE, ITAIVAN_MAX_PAGES)
+
+    if not PLAYWRIGHT_ENABLED:
+        log.warning("    Itaivan: PLAYWRIGHT_ENABLED=false — sem renderização Playwright.")
+        meta["render_fallback"] = True
+        return [], meta
 
     if not PLAYWRIGHT_AVAILABLE:
         log.warning("    Itaivan: Playwright não instalado — usando extrator estático (resultados limitados).")
@@ -1090,26 +1492,15 @@ def scrape_itaivan_playwright(site: dict, max_pages: int | None = None) -> tuple
     log.info("    Itaivan: Playwright — listagem: %s", first_url[:88] + ("…" if len(first_url) > 88 else ""))
 
     try:
-        with _sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(locale="pt-BR")
-            page.set_default_timeout(30000)
+        with playwright_browser_page() as page:
+            if page is None:
+                meta["render_fallback"] = True
+                meta["playwright_error_type"] = "PlaywrightUnavailable"
+                meta["playwright_error_message"] = "Playwright indisponível (pacote ou slot)."
+                return [], meta
 
-            page.goto(first_url, wait_until="networkidle", timeout=60000)
-            page.wait_for_timeout(2000)
-
-            # Dispensa banner de cookies se aparecer
-            for loc in (
-                page.get_by_role("button", name=re.compile(r"entendi|aceito|ok|concordo|aceitar", re.I)),
-                page.locator(".cc-btn"),
-            ):
-                if loc.count():
-                    try:
-                        loc.first.click(timeout=3000)
-                        page.wait_for_timeout(500)
-                    except Exception:
-                        pass
-                    break
+            _playwright_goto_listing(page, first_url)
+            _playwright_dismiss_cookies(page)
 
             list_base_url = page.url
 
@@ -1117,8 +1508,8 @@ def scrape_itaivan_playwright(site: dict, max_pages: int | None = None) -> tuple
                 meta["pages_attempted"] += 1
                 if pagina > 1:
                     next_url = _itaivan_url_with_page(list_base_url, pagina)
-                    page.goto(next_url, wait_until="networkidle", timeout=60000)
-                    page.wait_for_timeout(1800)
+                    _playwright_goto_listing(page, next_url)
+                    page.wait_for_timeout(800)
 
                 links = page.locator('a[href*="/imovel/"]')
                 count = links.count()
@@ -1198,8 +1589,6 @@ def scrape_itaivan_playwright(site: dict, max_pages: int | None = None) -> tuple
                     break
 
                 time.sleep(0.8)
-
-            browser.close()
 
     except Exception as e:
         et, em = format_exception(e)
@@ -1302,6 +1691,8 @@ GERENCIAR_IMOVEIS_CF_API_PROPERTIES = (
 
 PLATFORM_FAMILY_GENERIC = "generic"
 PLATFORM_FAMILY_GERENCIAR_IMOVEIS_CF = "gerenciarimoveis_cf"
+PLATFORM_FAMILY_APREME_PLAYWRIGHT = "apreme_playwright"
+PLATFORM_FAMILY_LOFT_PLAYWRIGHT = "loft_playwright"
 
 # Códigos de probe (API-first / operação)
 GERENCIAR_CF_PROBE_SUCCEEDED = "api_probe_succeeded"
@@ -1501,7 +1892,16 @@ def detect_platform_family(
         "x_domain_host_used": "",
         "detail_domain": _netloc_for_x_domain(listing_url),
         "variants_tried": [],
+        "playwright_listing_host": "",
     }
+    if PLAYWRIGHT_ENABLED:
+        h = _normalized_listing_host(listing_url)
+        diag["playwright_listing_host"] = h
+        if h in PLAYWRIGHT_APRE_HOSTS:
+            return PLATFORM_FAMILY_APREME_PLAYWRIGHT, diag
+        if h in PLAYWRIGHT_LOFT_HOSTS:
+            return PLATFORM_FAMILY_LOFT_PLAYWRIGHT, diag
+
     if not listing_url_signals_gerenciar_imoveis_cf(listing_url):
         return PLATFORM_FAMILY_GENERIC, diag
 
@@ -1823,6 +2223,8 @@ def extract_imoveis_gerenciar_imoveis_cf_api(
 def _register_api_first_families() -> None:
     """Registro tardio: evita NameError na definição da função."""
     API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_GERENCIAR_IMOVEIS_CF] = extract_imoveis_gerenciar_imoveis_cf_api
+    API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_APREME_PLAYWRIGHT] = extract_imoveis_apreme_playwright
+    API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_LOFT_PLAYWRIGHT] = extract_imoveis_loft_playwright
 
 
 _register_api_first_families()
@@ -1837,13 +2239,16 @@ def dispatch_api_first_family_extract(
     api_x_domain: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
     """
-    Ponto único para futuras famílias API-first. Hoje só ``gerenciarimoveis_cf``
-    (requer ``api_x_domain`` do probe).
+    Famílias API-first / Playwright-first registradas em ``API_FIRST_FAMILY_REGISTRY``.
     """
     if family == PLATFORM_FAMILY_GERENCIAR_IMOVEIS_CF:
         return extract_imoveis_gerenciar_imoveis_cf_api(
             session, listing_url, site, api_x_domain=api_x_domain
         )
+    if family == PLATFORM_FAMILY_APREME_PLAYWRIGHT:
+        return extract_imoveis_apreme_playwright(site)
+    if family == PLATFORM_FAMILY_LOFT_PLAYWRIGHT:
+        return extract_imoveis_loft_playwright(site)
     return None
 
 
@@ -3737,6 +4142,132 @@ def _log_pagination_guard_failure(site_name: str, guard, target_page: int) -> No
         )
 
 
+def _scrape_site_finish_playwright_listing(
+    site: dict,
+    conn: sqlite3.Connection,
+    agora: str,
+    t_mono: float,
+    stats: dict,
+    summary: SiteRunSummary,
+    hashes_vistos: set,
+    historico_dedupe: ImovelHistoricoDedupeMap,
+    run_id: int | None,
+    retry_context: dict | None,
+    erro_msg_full: str | None,
+    imoveis_todos: list[dict],
+    pw_meta: dict[str, Any],
+    pw_note_key: str,
+) -> dict:
+    """Persistência + status + remoções após coleta Playwright (Itaivan / Apre / Loft)."""
+    had_render_error = False
+    summary.pages_attempted = int(pw_meta.get("pages_attempted") or 0)
+    summary.pages_succeeded = int(pw_meta.get("pages_succeeded") or 0)
+    summary.notes.append(json.dumps({pw_note_key: pw_meta}, ensure_ascii=False))
+
+    if pw_meta.get("playwright_error_type"):
+        summary.error_type = pw_meta["playwright_error_type"]
+        summary.error_message = pw_meta.get("playwright_error_message")
+        summary.warnings.append(
+            f"Playwright: {summary.error_type}: {summary.error_message or ''}"
+        )
+        if not imoveis_todos:
+            had_render_error = True
+        else:
+            summary.warnings.append("Coleta parcial antes do erro no Playwright.")
+    elif pw_meta.get("render_fallback"):
+        had_render_error = True
+        summary.error_type = "PlaywrightUnavailable"
+        summary.error_message = (
+            pw_meta.get("playwright_error_message")
+            or "Playwright não disponível ou desativado para renderização."
+        )
+
+    if imoveis_todos:
+        imoveis_todos = normalizar_com_ia(imoveis_todos)
+        page_stats = upsert_imoveis(
+            conn,
+            imoveis_todos,
+            site["id"],
+            run_id=run_id,
+            historico_dedupe=historico_dedupe,
+        )
+        _merge_identity_stats(summary, page_stats)
+        _merge_data_quality_stats(summary, page_stats)
+        for k in ["novos", "atualizados", "sem_mudanca"]:
+            stats[k] += page_stats[k]
+        stats["total"] += len(imoveis_todos)
+        hashes_vistos.update(im["hash"] for im in imoveis_todos if im.get("hash"))
+
+    vol = stats["total"]
+    baseline_row_it = get_site_baseline(conn, site["id"])
+    b_avail_it, bmin_it, bmax_it, hcnt_it = _unpack_baseline_for_resolve(baseline_row_it)
+    if had_render_error and vol == 0:
+        extraction = SiteExtractionStatus.ERRO_RENDERIZACAO
+        _apply_extraction_anomalies_and_logs(
+            site, summary, stats, extraction, "heuristic", baseline_row_it, False
+        )
+    elif vol == 0:
+        extraction = SiteExtractionStatus.SUSPEITO_ZERO_RESULTADOS
+        _apply_extraction_anomalies_and_logs(
+            site, summary, stats, extraction, "heuristic", baseline_row_it, False
+        )
+    else:
+        extraction, status_src_it = resolve_final_extraction_status(
+            had_request_error=False,
+            had_render_error=False,
+            pagination_error=False,
+            queda_abrupta=False,
+            page1_bruto_zero=False,
+            page1_dedupe_zero_but_bruto_positive=False,
+            listagem_invalida=False,
+            volume_total=vol,
+            baseline_available=b_avail_it,
+            baseline_expected_min=bmin_it,
+            baseline_healthy_runs_count=hcnt_it,
+        )
+        _apply_extraction_anomalies_and_logs(
+            site,
+            summary,
+            stats,
+            extraction,
+            status_src_it,
+            baseline_row_it,
+            False,
+        )
+
+    rm = apply_site_removals_with_guard(
+        conn,
+        site,
+        hashes_vistos,
+        extraction,
+        vol,
+        run_id=run_id,
+        historico_dedupe=historico_dedupe,
+    )
+    stats["removidos"] = rm["removidos"]
+    stats["removals_blocked"] = rm["removals_blocked"]
+    stats["removals_blocked_reason"] = rm["removals_blocked_reason"]
+    stats["removed_count_attempted"] = rm["removed_count_attempted"]
+    stats["removed_count_applied"] = rm["removed_count_applied"]
+    stats["removals_previous_keys"] = rm["removals_previous_keys"]
+    stats["removals_current_keys"] = rm["removals_current_keys"]
+
+    summary.seal(t_mono)
+    _persist_site_log(conn, agora, site, stats, summary, extraction, erro_msg_full, retry_context)
+    log.info(
+        "    ✓ %s total | +%s novos | ~%s atualizados | -%s removidos  | status=%s | id=%s",
+        stats["total"],
+        stats["novos"],
+        stats["atualizados"],
+        stats["removidos"],
+        extraction.value,
+        summary.identity_stats or {},
+    )
+    stats["extraction_status"] = extraction.value
+    stats["site_summary"] = summary.to_dict()
+    return stats
+
+
 def scrape_site(
     site: dict,
     conn,
@@ -3778,113 +4309,99 @@ def scrape_site(
         # ── Itaivan: scraper dedicado Playwright ──────────────────────────────
         if "itaivan.com" in site["url"]:
             imoveis_todos, pw_meta = scrape_itaivan_playwright(site)
-            summary.pages_attempted = int(pw_meta.get("pages_attempted") or 0)
-            summary.pages_succeeded = int(pw_meta.get("pages_succeeded") or 0)
-            summary.notes.append(json.dumps({"itaivan_playwright": pw_meta}, ensure_ascii=False))
-
-            if pw_meta.get("playwright_error_type"):
-                summary.error_type = pw_meta["playwright_error_type"]
-                summary.error_message = pw_meta.get("playwright_error_message")
-                summary.warnings.append(
-                    f"Playwright: {summary.error_type}: {summary.error_message or ''}"
-                )
-                if not imoveis_todos:
-                    had_render_error = True
-                else:
-                    summary.warnings.append("Coleta parcial antes do erro no Playwright.")
-            elif pw_meta.get("render_fallback"):
-                had_render_error = True
-                summary.error_type = "PlaywrightUnavailable"
-                summary.error_message = "Playwright não disponível para renderização."
-
-            if imoveis_todos:
-                imoveis_todos = normalizar_com_ia(imoveis_todos)
-                page_stats = upsert_imoveis(
-                    conn,
-                    imoveis_todos,
-                    site["id"],
-                    run_id=run_id,
-                    historico_dedupe=historico_dedupe,
-                )
-                _merge_identity_stats(summary, page_stats)
-                _merge_data_quality_stats(summary, page_stats)
-                for k in ["novos", "atualizados", "sem_mudanca"]:
-                    stats[k] += page_stats[k]
-                stats["total"] += len(imoveis_todos)
-                hashes_vistos.update(im["hash"] for im in imoveis_todos if im.get("hash"))
-
-            vol = stats["total"]
-            baseline_row_it = get_site_baseline(conn, site["id"])
-            b_avail_it, bmin_it, bmax_it, hcnt_it = _unpack_baseline_for_resolve(
-                baseline_row_it
-            )
-            if had_render_error and vol == 0:
-                extraction = SiteExtractionStatus.ERRO_RENDERIZACAO
-                _apply_extraction_anomalies_and_logs(
-                    site, summary, stats, extraction, "heuristic", baseline_row_it, False
-                )
-            elif vol == 0:
-                extraction = SiteExtractionStatus.SUSPEITO_ZERO_RESULTADOS
-                _apply_extraction_anomalies_and_logs(
-                    site, summary, stats, extraction, "heuristic", baseline_row_it, False
-                )
-            else:
-                extraction, status_src_it = resolve_final_extraction_status(
-                    had_request_error=False,
-                    had_render_error=False,
-                    pagination_error=False,
-                    queda_abrupta=False,
-                    page1_bruto_zero=False,
-                    page1_dedupe_zero_but_bruto_positive=False,
-                    listagem_invalida=False,
-                    volume_total=vol,
-                    baseline_available=b_avail_it,
-                    baseline_expected_min=bmin_it,
-                    baseline_healthy_runs_count=hcnt_it,
-                )
-                _apply_extraction_anomalies_and_logs(
-                    site,
-                    summary,
-                    stats,
-                    extraction,
-                    status_src_it,
-                    baseline_row_it,
-                    False,
-                )
-
-            rm = apply_site_removals_with_guard(
-                conn,
+            return _scrape_site_finish_playwright_listing(
                 site,
+                conn,
+                agora,
+                t_mono,
+                stats,
+                summary,
                 hashes_vistos,
-                extraction,
-                vol,
-                run_id=run_id,
-                historico_dedupe=historico_dedupe,
+                historico_dedupe,
+                run_id,
+                retry_context,
+                erro_msg_full,
+                imoveis_todos,
+                pw_meta,
+                "itaivan_playwright",
             )
-            stats["removidos"] = rm["removidos"]
-            stats["removals_blocked"] = rm["removals_blocked"]
-            stats["removals_blocked_reason"] = rm["removals_blocked_reason"]
-            stats["removed_count_attempted"] = rm["removed_count_attempted"]
-            stats["removed_count_applied"] = rm["removed_count_applied"]
-            stats["removals_previous_keys"] = rm["removals_previous_keys"]
-            stats["removals_current_keys"] = rm["removals_current_keys"]
 
-            summary.seal(t_mono)
-            _persist_site_log(
-                conn, agora, site, stats, summary, extraction, erro_msg_full, retry_context
+        # ── Apre.me / Loft: listagem JS (Playwright), antes do fluxo HTTP ─────
+        pw_fam, pw_fam_diag = detect_platform_family(site["url"], None, session)
+        if pw_fam == PLATFORM_FAMILY_APREME_PLAYWRIGHT:
+            summary.notes.append(
+                json.dumps({"playwright_family_detection": pw_fam_diag}, ensure_ascii=False)
             )
-            log.info(
-                "    ✓ %s total | +%s novos | ~%s atualizados | -%s removidos  | status=%s | id=%s",
-                stats["total"],
-                stats["novos"],
-                stats["atualizados"],
-                stats["removidos"],
-                extraction.value,
-                summary.identity_stats or {},
+            pair = dispatch_api_first_family_extract(
+                PLATFORM_FAMILY_APREME_PLAYWRIGHT,
+                session,
+                site["url"],
+                site,
             )
-            stats["extraction_status"] = extraction.value
-            stats["site_summary"] = summary.to_dict()
-            return stats
+            imoveis_todos, pw_meta = (
+                pair
+                if pair is not None
+                else (
+                    [],
+                    {
+                        "render_fallback": True,
+                        "playwright_error_message": "dispatch_api_first_family_extract retornou None",
+                    },
+                )
+            )
+            return _scrape_site_finish_playwright_listing(
+                site,
+                conn,
+                agora,
+                t_mono,
+                stats,
+                summary,
+                hashes_vistos,
+                historico_dedupe,
+                run_id,
+                retry_context,
+                erro_msg_full,
+                imoveis_todos,
+                pw_meta,
+                "apreme_playwright",
+            )
+        if pw_fam == PLATFORM_FAMILY_LOFT_PLAYWRIGHT:
+            summary.notes.append(
+                json.dumps({"playwright_family_detection": pw_fam_diag}, ensure_ascii=False)
+            )
+            pair = dispatch_api_first_family_extract(
+                PLATFORM_FAMILY_LOFT_PLAYWRIGHT,
+                session,
+                site["url"],
+                site,
+            )
+            imoveis_todos, pw_meta = (
+                pair
+                if pair is not None
+                else (
+                    [],
+                    {
+                        "render_fallback": True,
+                        "playwright_error_message": "dispatch_api_first_family_extract retornou None",
+                    },
+                )
+            )
+            return _scrape_site_finish_playwright_listing(
+                site,
+                conn,
+                agora,
+                t_mono,
+                stats,
+                summary,
+                hashes_vistos,
+                historico_dedupe,
+                run_id,
+                retry_context,
+                erro_msg_full,
+                imoveis_todos,
+                pw_meta,
+                "loft_playwright",
+            )
 
         # ── Fluxo normal (requests + BeautifulSoup) ───────────────────────────
         url = site["url"]
