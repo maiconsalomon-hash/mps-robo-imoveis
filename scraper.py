@@ -25,6 +25,9 @@ Sites Next.js da família Tecimob / Gerenciar Imóveis CF (URLs ``/comprar/imove
 ``/comprar-alugar/imoveis`` com ``offset`` + ``limit``) são detectados por
 ``detect_platform_family`` e coletados pela API pública com header ``x-domain``, sem depender
 de cards no HTML (evita ``ERRO_LISTAGEM_INVALIDA`` nesse shell).
+Sites Apresenta.me / Vista Web (``script.apre.me``, cards ``div.LI_Imovel``, ``var $CONFIG``)
+paginam via POST JSON ``/busca`` (campo ``html`` + ``total``; parâmetro acumulativo ``LIMIT``);
+família ``vista_web_api`` — sem JSON puro de lista, mas consumível com ``requests`` (sem Playwright).
 """
 
 import sqlite3
@@ -1703,6 +1706,7 @@ GERENCIAR_IMOVEIS_CF_API_PROPERTIES = (
 
 PLATFORM_FAMILY_GENERIC = "generic"
 PLATFORM_FAMILY_GERENCIAR_IMOVEIS_CF = "gerenciarimoveis_cf"
+PLATFORM_FAMILY_VISTA_WEB_API = "vista_web_api"
 PLATFORM_FAMILY_APREME_PLAYWRIGHT = "apreme_playwright"
 PLATFORM_FAMILY_LOFT_PLAYWRIGHT = "loft_playwright"
 
@@ -1892,8 +1896,8 @@ def detect_platform_family(
     listing_url: str, html: str | None, session: requests.Session
 ) -> tuple[str, dict[str, Any]]:
     """
-    Retorna (family, diagnóstico). ``gerenciarimoveis_cf`` só após assinatura de URL + probe
-    com schema válido (inclui lista vazia: inventário zero no site).
+    Retorna (family, diagnóstico). ``gerenciarimoveis_cf`` após assinatura de URL + probe na API
+    Tecimob. ``vista_web_api`` após ``div.LI_Imovel`` + ``script.apre.me`` + probe POST ``/busca``.
     """
     diag: dict[str, Any] = {
         "listing_url_signal": False,
@@ -1905,6 +1909,10 @@ def detect_platform_family(
         "detail_domain": _netloc_for_x_domain(listing_url),
         "variants_tried": [],
         "playwright_listing_host": "",
+        "vista_busca_probe_used": False,
+        "vista_busca_probe_status": "",
+        "vista_busca_page_size": 18,
+        "vista_busca_finalidade": "sale",
     }
     if PLAYWRIGHT_ENABLED:
         h = _normalized_listing_host(listing_url)
@@ -1914,22 +1922,30 @@ def detect_platform_family(
         if h in PLAYWRIGHT_LOFT_HOSTS:
             return PLATFORM_FAMILY_LOFT_PLAYWRIGHT, diag
 
-    if not listing_url_signals_gerenciar_imoveis_cf(listing_url):
-        return PLATFORM_FAMILY_GENERIC, diag
+    if listing_url_signals_gerenciar_imoveis_cf(listing_url):
+        diag["listing_url_signal"] = True
+        diag["gerenciar_cf_api_probe_used"] = True
+        if html and next_data_suggests_nextjs_list_page(html):
+            diag["next_data_list"] = True
 
-    diag["listing_url_signal"] = True
-    diag["gerenciar_cf_api_probe_used"] = True
-    if html and next_data_suggests_nextjs_list_page(html):
-        diag["next_data_list"] = True
+        probe = probe_gerenciar_imoveis_cf_api_resilient(session, listing_url)
+        diag["variants_tried"] = probe.get("variants_tried") or []
+        diag["probe_status"] = probe.get("probe_status") or ""
+        diag["api_probe_ok"] = bool(probe.get("ok"))
+        diag["x_domain_host_used"] = probe.get("x_domain_host_used") or ""
 
-    probe = probe_gerenciar_imoveis_cf_api_resilient(session, listing_url)
-    diag["variants_tried"] = probe.get("variants_tried") or []
-    diag["probe_status"] = probe.get("probe_status") or ""
-    diag["api_probe_ok"] = bool(probe.get("ok"))
-    diag["x_domain_host_used"] = probe.get("x_domain_host_used") or ""
+        if probe.get("ok"):
+            return PLATFORM_FAMILY_GERENCIAR_IMOVEIS_CF, diag
 
-    if probe.get("ok"):
-        return PLATFORM_FAMILY_GERENCIAR_IMOVEIS_CF, diag
+    if html and _listing_html_signals_vista_web_busca(html):
+        diag["vista_busca_probe_used"] = True
+        vprobe = probe_vista_web_busca_api(session, listing_url, html)
+        diag["vista_busca_probe_status"] = str(vprobe.get("probe_status") or "")
+        diag["vista_busca_page_size"] = int(vprobe.get("page_size") or 18)
+        diag["vista_busca_finalidade"] = str(vprobe.get("finalidade") or "sale")
+        if vprobe.get("ok"):
+            return PLATFORM_FAMILY_VISTA_WEB_API, diag
+
     return PLATFORM_FAMILY_GENERIC, diag
 
 
@@ -2232,6 +2248,365 @@ def extract_imoveis_gerenciar_imoveis_cf_api(
     return all_props, meta_out
 
 
+# ── Vista Web / Apresenta.me — POST /busca (JSON com fragmento HTML, LIMIT acumulativo) ──
+VISTA_BUSCA_PROBE_OK = "vista_busca_ok"
+VISTA_BUSCA_PROBE_HTTP = "vista_busca_http"
+VISTA_BUSCA_PROBE_NOT_JSON = "vista_busca_not_json"
+VISTA_BUSCA_PROBE_INVALID_JSON = "vista_busca_invalid_json"
+VISTA_BUSCA_PROBE_SCHEMA = "vista_busca_schema"
+VISTA_BUSCA_PROBE_EMPTY_HTML = "vista_busca_empty_html"
+VISTA_BUSCA_PROBE_NO_TOTAL = "vista_busca_no_total"
+VISTA_BUSCA_PROBE_FEW_CARDS = "vista_busca_few_cards"
+VISTA_BUSCA_PROBE_FAILED = "vista_busca_failed"
+VISTA_BUSCA_PROBE_TIMEOUT = "vista_busca_timeout"
+
+VISTA_BUSCA_STOP_COMPLETED = "completed_all_limits"
+VISTA_BUSCA_STOP_TOTAL_REACHED = "reached_total_reported"
+VISTA_BUSCA_STOP_NO_NEW = "no_new_items_in_batch"
+VISTA_BUSCA_STOP_HTTP = "busca_http_error"
+VISTA_BUSCA_STOP_SCHEMA = "busca_invalid_json"
+VISTA_BUSCA_STOP_MAX_CAP = "capped_max_limits"
+
+
+def _parse_apresenta_me_config(html: str) -> dict[str, Any] | None:
+    """Extrai o objeto JSON de ``var $CONFIG = {...}`` (Apresenta.me / Vista Web)."""
+    if not html or "var $CONFIG = " not in html:
+        return None
+    start = html.find("var $CONFIG = ")
+    i = start + len("var $CONFIG = ")
+    if i >= len(html) or html[i] != "{":
+        return None
+    depth = 0
+    j = i
+    while j < len(html):
+        c = html[j]
+        if c == '"':
+            j += 1
+            while j < len(html):
+                if html[j] == "\\":
+                    j += 2
+                    continue
+                if html[j] == '"':
+                    break
+                j += 1
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(html[i : j + 1])
+                except json.JSONDecodeError:
+                    return None
+        j += 1
+    return None
+
+
+def _listing_html_signals_vista_web_busca(html: str) -> bool:
+    if not html or "script.apre.me" not in html:
+        return False
+    if "var $CONFIG = " not in html:
+        return False
+    soup = BeautifulSoup(html, "html.parser")
+    return len(soup.select("div.LI_Imovel")) >= 2
+
+
+def _infer_vista_busca_finalidade(listing_url: str) -> str:
+    path = (urlparse(listing_url).path or "").lower()
+    if any(
+        x in path
+        for x in (
+            "aluguel",
+            "locacao",
+            "locação",
+            "para-alugar",
+            "/alugar",
+        )
+    ):
+        return "rent"
+    return "sale"
+
+
+def _vista_listing_page_size_from_html(html: str) -> int:
+    soup = BeautifulSoup(html, "html.parser")
+    n = len(soup.select("div.LI_Imovel"))
+    if n < 6:
+        return 18
+    return max(9, min(30, n))
+
+
+def _classify_vista_busca_response(
+    r: requests.Response,
+) -> tuple[str, dict[str, Any] | None]:
+    if r.status_code != 200:
+        return f"{VISTA_BUSCA_PROBE_HTTP}:{r.status_code}", None
+    ct = (r.headers.get("content-type") or "").lower()
+    raw = (r.text or "").lstrip()
+    try:
+        if "json" in ct:
+            body = r.json()
+        elif raw.startswith("{"):
+            body = json.loads(r.text)
+        else:
+            return f"{VISTA_BUSCA_PROBE_NOT_JSON}:{ct[:48]}", None
+    except json.JSONDecodeError:
+        return VISTA_BUSCA_PROBE_INVALID_JSON, None
+    if not isinstance(body, dict):
+        return VISTA_BUSCA_PROBE_SCHEMA, None
+    frag = body.get("html")
+    if not isinstance(frag, str) or not frag.strip():
+        return VISTA_BUSCA_PROBE_EMPTY_HTML, body
+    if body.get("total") is None:
+        return VISTA_BUSCA_PROBE_NO_TOTAL, body
+    n_cards = len(BeautifulSoup(frag, "html.parser").select("div.LI_Imovel"))
+    if n_cards < 2:
+        return VISTA_BUSCA_PROBE_FEW_CARDS, body
+    return VISTA_BUSCA_PROBE_OK, body
+
+
+def _post_vista_busca(
+    session: requests.Session,
+    listing_url: str,
+    domain: str,
+    session_id: str,
+    finalidade: str,
+    limit: int,
+) -> requests.Response:
+    pu = urlparse(listing_url)
+    scheme = (pu.scheme or "https").lower()
+    origin = f"{scheme}://{domain}"
+    data = {
+        "SESSION_ID": session_id,
+        "DOMAIN": domain,
+        "url": "../../",
+        "SHOW_SEARCH": "true",
+        "FORM_DATA[searchExtra]": "[]",
+        "FORM_DATA[finalidade]": finalidade,
+        "FORM_DATA[desc]": "",
+        "FORM_DATA[medida][MIN]": "",
+        "FORM_DATA[medida][MAX]": "",
+        "FORM_DATA[valor][MIN]": "",
+        "FORM_DATA[valor][MAX]": "",
+        "FORM_DATA[delivery_date][IN]": "",
+        "FORM_DATA[delivery_date][OUT]": "",
+        "FORM_DATA[order]": "data_atualizacao",
+        "forceShow": "",
+        "clear": "false",
+        "searchMap": "0",
+        "GRID_ONLY": "1",
+        "LIMIT": str(limit),
+    }
+    body = urlencode(data)
+    return session.post(
+        f"https://{domain}/busca",
+        data=body.encode("utf-8"),
+        headers={
+            **HEADERS,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Accept": "*/*",
+            "Origin": origin,
+            "Referer": listing_url,
+            "X-Requested-With": "XMLHttpRequest",
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+
+
+def probe_vista_web_busca_api(
+    session: requests.Session, listing_url: str, html: str
+) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "ok": False,
+        "probe_status": VISTA_BUSCA_PROBE_FAILED,
+        "page_size": 18,
+        "finalidade": "sale",
+        "domain": "",
+        "http_status": None,
+    }
+    cfg = _parse_apresenta_me_config(html)
+    if not cfg:
+        out["probe_status"] = VISTA_BUSCA_PROBE_FAILED
+        return out
+    domain = str(cfg.get("DOMAIN") or "").strip().lower()
+    sid = str(cfg.get("SESSION_ID") or "").strip()
+    if not domain or not sid:
+        out["probe_status"] = VISTA_BUSCA_PROBE_FAILED
+        return out
+    out["domain"] = domain
+    fin = _infer_vista_busca_finalidade(listing_url)
+    out["finalidade"] = fin
+    page_size = _vista_listing_page_size_from_html(html)
+    out["page_size"] = page_size
+    try:
+        r = _post_vista_busca(session, listing_url, domain, sid, fin, page_size)
+    except requests_exceptions.Timeout:
+        out["probe_status"] = VISTA_BUSCA_PROBE_TIMEOUT
+        return out
+    except requests_exceptions.RequestException:
+        out["probe_status"] = VISTA_BUSCA_PROBE_FAILED
+        return out
+    except OSError:
+        out["probe_status"] = VISTA_BUSCA_PROBE_FAILED
+        return out
+    out["http_status"] = r.status_code
+    st, _body = _classify_vista_busca_response(r)
+    out["probe_status"] = st
+    if st == VISTA_BUSCA_PROBE_OK:
+        out["ok"] = True
+    return out
+
+
+def extract_imoveis_vista_web_busca_api(
+    session: requests.Session,
+    listing_url: str,
+    site: dict,
+    listing_html: str,
+    *,
+    page_size: int,
+    finalidade: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    Lista completa via POST ``/busca`` (JSON ``html`` + ``total``), paginação por ``LIMIT``
+    18, 36, 54, … Itens extraídos com ``extract_imoveis_li_imovel_div`` (mesmo pipeline).
+    """
+    meta_out: dict[str, Any] = {
+        "pagination_pattern": "vista_busca_limit_accumulator",
+        "page_size": page_size,
+        "finalidade": finalidade,
+        "limits_fetched": 0,
+        "total_items": 0,
+        "detail_links": 0,
+        "total_reported": None,
+        "validation_reason": "",
+        "last_error": "",
+        "stop_reason": "",
+    }
+    html_src = (listing_html or "").strip()
+    if not html_src:
+        try:
+            r0 = session.get(listing_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            r0.raise_for_status()
+            html_src = r0.text
+        except requests_exceptions.RequestException as e:
+            et, em = format_exception(e)
+            meta_out["last_error"] = f"{et}: {em}"
+            meta_out["stop_reason"] = VISTA_BUSCA_STOP_HTTP
+            meta_out["validation_reason"] = "listing_fetch_failed"
+            return [], meta_out
+    cfg = _parse_apresenta_me_config(html_src)
+    if not cfg:
+        meta_out["stop_reason"] = VISTA_BUSCA_PROBE_FAILED
+        meta_out["validation_reason"] = "missing_config"
+        return [], meta_out
+    domain = str(cfg.get("DOMAIN") or "").strip().lower()
+    sid = str(cfg.get("SESSION_ID") or "").strip()
+    if not domain or not sid:
+        meta_out["validation_reason"] = "missing_domain_or_session"
+        meta_out["stop_reason"] = VISTA_BUSCA_PROBE_FAILED
+        return [], meta_out
+
+    seen_keys: set[str] = set()
+    all_items: list[dict[str, Any]] = []
+    total_reported: int | None = None
+    step = max(6, min(40, int(page_size) or 18))
+    max_limit = step * MAX_PAGES_PER_SITE
+    cur_limit = step
+
+    while cur_limit <= max_limit:
+        try:
+            r = _post_vista_busca(session, listing_url, domain, sid, finalidade, cur_limit)
+            r.raise_for_status()
+            body = r.json()
+        except requests_exceptions.Timeout as e:
+            et, em = format_exception(e)
+            meta_out["last_error"] = f"{et}: {em}"
+            meta_out["stop_reason"] = VISTA_BUSCA_STOP_HTTP if all_items else VISTA_BUSCA_PROBE_TIMEOUT
+            break
+        except requests_exceptions.RequestException as e:
+            et, em = format_exception(e)
+            meta_out["last_error"] = f"{et}: {em}"
+            meta_out["stop_reason"] = VISTA_BUSCA_STOP_HTTP
+            break
+        except (json.JSONDecodeError, ValueError) as e:
+            et, em = format_exception(e)
+            meta_out["last_error"] = f"{et}: {em}"
+            meta_out["stop_reason"] = VISTA_BUSCA_STOP_SCHEMA
+            break
+
+        if not isinstance(body, dict):
+            meta_out["stop_reason"] = VISTA_BUSCA_STOP_SCHEMA
+            meta_out["last_error"] = "body_not_object"
+            break
+        frag = body.get("html")
+        if not isinstance(frag, str):
+            meta_out["stop_reason"] = VISTA_BUSCA_STOP_SCHEMA
+            meta_out["last_error"] = "html_not_str"
+            break
+        raw_total = body.get("total")
+        try:
+            tr = int(str(raw_total).strip()) if raw_total is not None else 0
+        except (TypeError, ValueError):
+            tr = 0
+        if total_reported is None and raw_total is not None:
+            total_reported = tr
+            meta_out["total_reported"] = tr
+
+        batch = extract_imoveis_li_imovel_div(
+            frag,
+            listing_url,
+            site,
+            max_cards=max(120, cur_limit + 40),
+        )
+        meta_out["limits_fetched"] = cur_limit
+
+        new_n = 0
+        for im in batch:
+            key = _norm_listing_url(im.get("url_anuncio")) or str(im.get("codigo") or "").strip()
+            if not key:
+                key = stable_hash_for_record(im)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            all_items.append(im)
+            new_n += 1
+
+        if new_n == 0:
+            meta_out["stop_reason"] = VISTA_BUSCA_STOP_NO_NEW
+            break
+
+        if total_reported is not None and total_reported > 0 and len(all_items) >= total_reported:
+            meta_out["stop_reason"] = VISTA_BUSCA_STOP_TOTAL_REACHED
+            break
+
+        if cur_limit >= max_limit:
+            meta_out["stop_reason"] = VISTA_BUSCA_STOP_MAX_CAP
+            break
+
+        cur_limit += step
+
+    if not meta_out["stop_reason"] and all_items:
+        meta_out["stop_reason"] = VISTA_BUSCA_STOP_COMPLETED
+
+    meta_out["total_items"] = len(all_items)
+    meta_out["detail_links"] = sum(1 for x in all_items if x.get("url_anuncio"))
+    meta_out["validation_reason"] = (
+        "busca_json_returned_li_imovel_fragments"
+        if all_items
+        else (meta_out.get("last_error") or "busca_empty")
+    )
+
+    log.info(
+        "Vista Web /busca: %s — %s imóveis | LIMIT até %s | stop=%s | total_site=%s | finalidade=%s",
+        site["name"],
+        meta_out["total_items"],
+        meta_out["limits_fetched"],
+        meta_out.get("stop_reason") or "?",
+        meta_out.get("total_reported"),
+        finalidade,
+    )
+    return all_items, meta_out
+
+
 def _register_api_first_families() -> None:
     """Registro tardio: evita NameError na definição da função."""
     API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_GERENCIAR_IMOVEIS_CF] = extract_imoveis_gerenciar_imoveis_cf_api
@@ -2249,6 +2624,9 @@ def dispatch_api_first_family_extract(
     site: dict,
     *,
     api_x_domain: str = "",
+    listing_html: str = "",
+    vista_page_size: int = 18,
+    vista_finalidade: str = "sale",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
     """
     Famílias API-first / Playwright-first registradas em ``API_FIRST_FAMILY_REGISTRY``.
@@ -2256,6 +2634,15 @@ def dispatch_api_first_family_extract(
     if family == PLATFORM_FAMILY_GERENCIAR_IMOVEIS_CF:
         return extract_imoveis_gerenciar_imoveis_cf_api(
             session, listing_url, site, api_x_domain=api_x_domain
+        )
+    if family == PLATFORM_FAMILY_VISTA_WEB_API:
+        return extract_imoveis_vista_web_busca_api(
+            session,
+            listing_url,
+            site,
+            listing_html,
+            page_size=vista_page_size,
+            finalidade=vista_finalidade or "sale",
         )
     if family == PLATFORM_FAMILY_APREME_PLAYWRIGHT:
         return extract_imoveis_apreme_playwright(site)
@@ -2357,10 +2744,13 @@ def _pick_li_imovel_detail_href(card, base_url: str) -> str:
     return fallback[0] if fallback else ""
 
 
-def extract_imoveis_li_imovel_div(html: str, base_url: str, site: dict) -> list[dict]:
+def extract_imoveis_li_imovel_div(
+    html: str, base_url: str, site: dict, *, max_cards: int = 80
+) -> list[dict]:
     """
     Família “Vista Web” / CRM comum no Brasil: cards ``div.LI_Imovel``, detalhe em slug
     (muitas vezes ``...-ref-123``). Vários domínios distintos reutilizam o mesmo HTML.
+    ``max_cards`` limita o laço (listagens /busca podem trazer dezenas de cards de uma vez).
     """
     soup = BeautifulSoup(html, "html.parser")
     cards = soup.select("div.LI_Imovel")
@@ -2368,9 +2758,10 @@ def extract_imoveis_li_imovel_div(html: str, base_url: str, site: dict) -> list[
     if len(cards) < 3:
         return []
 
+    cap = max(80, min(max_cards, 600))
     results: list[dict] = []
     seen_url: set[str] = set()
-    for card in cards[:80]:
+    for card in cards[:cap]:
         url_anuncio = _pick_li_imovel_detail_href(card, base_url)
         if not url_anuncio or url_anuncio in seen_url:
             continue
@@ -4709,7 +5100,7 @@ def scrape_site(
                     )
                     break
 
-            used_gerenciar_cf_api = False
+            used_api_first_listing = False
             imoveis_pagina: list[dict[str, Any]] = []
             if page_num == 1:
                 plat_fam, fam_diag = detect_platform_family(url_final, html, session)
@@ -4732,7 +5123,7 @@ def scrape_site(
                     imoveis_pagina, api_meta = (
                         _pair if _pair is not None else ([], {"validation_reason": "dispatch_returned_none"})
                     )
-                    used_gerenciar_cf_api = True
+                    used_api_first_listing = True
                     summary.family_specific_extractor_used = True
                     summary.family_card_count = int(api_meta.get("total_items") or 0)
                     summary.family_detail_links_count = int(api_meta.get("detail_links") or 0)
@@ -4760,7 +5151,38 @@ def scrape_site(
                             ensure_ascii=False,
                         )
                     )
-            if not used_gerenciar_cf_api:
+                elif plat_fam == PLATFORM_FAMILY_VISTA_WEB_API:
+                    v_ps = int(fam_diag.get("vista_busca_page_size") or 18)
+                    v_fn = str(fam_diag.get("vista_busca_finalidade") or "sale")
+                    _pair = dispatch_api_first_family_extract(
+                        PLATFORM_FAMILY_VISTA_WEB_API,
+                        session,
+                        url_final,
+                        site,
+                        listing_html=html,
+                        vista_page_size=v_ps,
+                        vista_finalidade=v_fn,
+                    )
+                    imoveis_pagina, api_meta = (
+                        _pair if _pair is not None else ([], {"validation_reason": "dispatch_returned_none"})
+                    )
+                    used_api_first_listing = True
+                    summary.family_specific_extractor_used = True
+                    summary.family_card_count = int(api_meta.get("total_items") or 0)
+                    summary.family_detail_links_count = int(api_meta.get("detail_links") or 0)
+                    summary.family_pagination_pattern_detected = str(
+                        api_meta.get("pagination_pattern") or ""
+                    )
+                    summary.family_listing_validation_reason = str(
+                        api_meta.get("validation_reason") or ""
+                    )
+                    summary.notes.append(
+                        json.dumps(
+                            {"vista_web_busca_api": api_meta, "family_detection": fam_diag},
+                            ensure_ascii=False,
+                        )
+                    )
+            if not used_api_first_listing:
                 imoveis_pagina = extract_imoveis_generic(html, url_final, site)
 
             if not imoveis_pagina:
@@ -4772,7 +5194,7 @@ def scrape_site(
                 elif page_num == 1:
                     page1_bruto_zero = True
                     # Shell Next.js “parece” listagem no HTML mas a extração é via API nesta família.
-                    if html_sugere_listagem(html) and not used_gerenciar_cf_api:
+                    if html_sugere_listagem(html) and not used_api_first_listing:
                         listagem_invalida = True
                 log.info(f"    Página {page_num}: 0 imóveis — parando paginação")
                 break
@@ -4848,11 +5270,12 @@ def scrape_site(
             summary.typical_page_volume = round(typical_vol, 2)
             summary.pages_low_yield_count = cutoff_rs.pages_low_yield_count
 
-            if used_gerenciar_cf_api:
+            if used_api_first_listing:
+                fam = summary.platform_family_detected or ""
                 log.info(
-                    "    %s: listagem completa via API (família gerenciarimoveis_cf); "
-                    "paginação HTML ignorada.",
+                    "    %s: listagem completa via API (%s); paginação HTML ignorada.",
                     site["name"],
+                    fam or "?",
                 )
                 break
 
