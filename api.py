@@ -26,6 +26,9 @@ import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from config import (
     API_HOST,
@@ -41,6 +44,8 @@ from scraper import DB_FILE, SITES, init_db, refresh_site_profiles, run_full_scr
 from scraper_scheduler import read_scheduler_state, run_scheduler_worker
 
 ROOT = Path(__file__).resolve().parent
+
+limiter = Limiter(key_func=get_remote_address)
 
 log = logging.getLogger("domus_api")
 if not logging.getLogger().handlers:
@@ -210,7 +215,7 @@ def _listening_port() -> int:
 def _init_supabase_properties_client() -> SupabasePropertiesRest | None:
     if not SUPABASE_SYNC_ENABLED:
         log.warning(
-            "SUPABASE_URL/SUPABASE_KEY ausentes — GET /api/v1/properties responderá 503 até configurar."
+            "Credenciais Supabase ausentes (URL e chave) — GET /api/v1/properties responderá 503 até configurar."
         )
         return None
     try:
@@ -271,6 +276,11 @@ def _map_supabase_row_to_api_item(row: dict[str, Any]) -> dict[str, Any]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _scheduler_thread
+    if not (ROBOT_API_KEY or "").strip():
+        log.warning(
+            "Chave da API (header X-API-Key) não configurada no servidor — rotas protegidas "
+            "retornarão 401 até definir a variável de ambiente correspondente no deploy (use um valor forte)."
+        )
     app.state.supabase_properties = _init_supabase_properties_client()
 
     conn = sqlite3.connect(DB_FILE)
@@ -304,12 +314,29 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    return response
 
 
 def require_api_key(
     x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
 ) -> None:
-    if not x_api_key or x_api_key != ROBOT_API_KEY:
+    expected = (ROBOT_API_KEY or "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Server API key is not configured",
+        )
+    if not x_api_key or x_api_key != expected:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing X-API-Key",
@@ -323,6 +350,7 @@ def get_db() -> sqlite3.Connection:
 
 
 @app.get("/health")
+@limiter.limit("30/minute")
 def health(request: Request) -> dict[str, Any]:
     st = read_scheduler_state(ROOT) or {}
     alive = bool(_scheduler_thread and _scheduler_thread.is_alive())
@@ -337,6 +365,7 @@ def health(request: Request) -> dict[str, Any]:
 
 
 @app.get("/api/v1/properties", dependencies=[Depends(require_api_key)])
+@limiter.limit("60/minute")
 def list_properties(
     request: Request,
     limit: int = Query(100, ge=1, le=500),
@@ -351,8 +380,8 @@ def list_properties(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                "Supabase não configurado ou indisponível. Defina SUPABASE_URL e SUPABASE_KEY "
-                "no ambiente e reinicie a API."
+                "Supabase não configurado ou indisponível. Defina a URL do projeto e a chave de API "
+                "(service role) no ambiente e reinicie a API."
             ),
         )
 
@@ -486,7 +515,8 @@ def _run_scrape_background(*, site_id: int | None, enrich_details: bool = False)
 
 
 @app.post("/api/v1/sources/run-all", dependencies=[Depends(require_api_key)])
-def trigger_run_all() -> JSONResponse:
+@limiter.limit("5/minute")
+def trigger_run_all(request: Request) -> JSONResponse:
     _run_scrape_background(site_id=None, enrich_details=False)
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,

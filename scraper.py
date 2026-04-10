@@ -117,9 +117,9 @@ log = logging.getLogger(__name__)
 
 if SUPABASE_CONFIG_INCOMPLETE:
     log.warning(
-        "Configuração Supabase incompleta: defina SUPABASE_URL e SUPABASE_KEY (ou "
-        "SUPABASE_SERVICE_ROLE_KEY) no arquivo .env ou no ambiente. O sync com Supabase "
-        "permanece desativado até os dois estarem definidos."
+        "Configuração Supabase incompleta: defina a URL do projeto e a chave de serviço "
+        "(variáveis documentadas no .env.example) no .env ou no ambiente. O sync permanece "
+        "desativado até ambas estarem definidas."
     )
 
 from site_baseline import (  # noqa: E402
@@ -194,6 +194,11 @@ REMOVALS_CURRENT_VS_PREVIOUS_MIN_RATIO = 0.35
 PAGINATION_FULL_PAGE_MIN = 18   # tamanho típico “cheio” (Morada vira ~21 após dedup URL/hash)
 PAGINATION_TAIL_RATIO = 0.34    # legado / doc; cauda aplicada via pagination_cutoff.TAIL_RATIO
 PAGINATION_TAIL_MAX_ITEMS = 18  # legado / doc; cauda aplicada via pagination_cutoff.TAIL_MAX_ITEMS
+# ``SUSPEITO_QUEDA_ABRUPTA``: página vazia após listagem cheia + HTML com “há mais”.
+# Com volume já elevado (vs. média saudável ou piso absoluto), trata como fim de lista benigno.
+QUEDA_ABRUPTA_SUPPRESS_MIN_VOLUME = 200
+QUEDA_ABRUPTA_SUPPRESS_BASELINE_MIN_RATIO = 0.18
+QUEDA_ABRUPTA_SUPPRESS_NO_BASELINE_VOLUME = 350
 # ANTHROPIC_API_KEY, Supabase: ver config.py e .env (.env.example)
 
 HEADERS = {
@@ -204,6 +209,9 @@ HEADERS = {
     ),
     "Accept-Language": "pt-BR,pt;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    # Sem ``br``: hosts Praedium (ex.: atlantaimoveis, luciannerodrigues) devolvem Brotli e o
+    # corpo chega corrompido na prática (~50k bytes binários), gerando ERRO_REQUISICAO/parse.
+    "Accept-Encoding": "gzip, deflate",
 }
 
 # ── Lista de imobiliárias ──────────────────────────────────────────────────────
@@ -1716,6 +1724,11 @@ PLATFORM_FAMILY_IMOVIEW_IMOVEIS_AJAX = "imoview_imoveis_ajax"
 PLATFORM_FAMILY_PHP_ACAO_ATUALIZA_IMOVEIS = "php_acao_atualiza_imoveis"
 # Imoview site próprio (objImovel.js): POST form ``/retornar-imoveis-disponiveis`` → JSON lista + quantidade
 PLATFORM_FAMILY_RETORNAR_IMOVEIS_DISPONIVEIS = "retornar_imoveis_disponiveis"
+# Sobressai (Next.js): POST ``/api/gql`` — schema inferido pelas mensagens de validação + bundle público.
+PLATFORM_FAMILY_SOBRESSAI_GRAPHQL = "sobressai_graphql"
+
+SOBRESSAI_GQL_PATH = "/api/gql"
+SOBRESSAI_GQL_PAGE_SIZE = 72
 
 # Códigos de probe (API-first / operação)
 GERENCIAR_CF_PROBE_SUCCEEDED = "api_probe_succeeded"
@@ -1899,6 +1912,309 @@ def probe_gerenciar_imoveis_cf_api_resilient(
     return out
 
 
+# ── Sobressai (Next.js + POST /api/gql) ───────────────────────────────────────
+
+SOBRESSAI_GQL_PROBE_OK = "sobressai_gql_ok"
+SOBRESSAI_GQL_PROBE_EMPTY = "sobressai_gql_empty"
+SOBRESSAI_GQL_PROBE_HTTP = "sobressai_gql_http"
+SOBRESSAI_GQL_PROBE_ERRORS = "sobressai_gql_graphql_errors"
+SOBRESSAI_GQL_PROBE_SCHEMA = "sobressai_gql_schema"
+SOBRESSAI_GQL_PROBE_FAILED = "sobressai_gql_failed"
+
+
+def listing_html_signals_sobressai(html: str) -> bool:
+    """CDN / marca Sobressai no HTML da listagem."""
+    if not html:
+        return False
+    low = html.lower()
+    return "sobressai.com.br" in low or "imobtotal" in low
+
+
+def _sobressai_gql_url(listing_url: str) -> str:
+    pu = urlparse(listing_url or "")
+    origin = f"{pu.scheme or 'https'}://{pu.netloc}".rstrip("/")
+    return origin + SOBRESSAI_GQL_PATH
+
+
+def _sobressai_gql_listing_body(pagina: int, qtd_pag: int) -> str:
+    p = max(1, int(pagina))
+    n = max(1, min(200, int(qtd_pag)))
+    return f"""
+    {{
+      imoveis(pagina: {p}, ordenar: Inclusao, ordem: desc, qtd_pag: {n}) {{
+        imoveis {{
+          id
+          titulo
+          endereco
+          preco_venda
+          dormitorios
+          area_total
+          area_privativa
+          cidade {{ nome }}
+          bairro {{ nome }}
+          tipo {{ nome }}
+          fotos {{ url_foto }}
+        }}
+      }}
+    }}
+    """
+
+
+def probe_sobressai_graphql(
+    session: requests.Session, listing_url: str
+) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "ok": False,
+        "probe_status": SOBRESSAI_GQL_PROBE_FAILED,
+        "http_status": None,
+        "gql_url": "",
+    }
+    if not listing_url:
+        return out
+    gql_url = _sobressai_gql_url(listing_url)
+    out["gql_url"] = gql_url
+    pu = urlparse(listing_url)
+    origin = f"{pu.scheme or 'https'}://{pu.netloc}".rstrip("/")
+    try:
+        r = session.post(
+            gql_url,
+            json={"query": _sobressai_gql_listing_body(1, 4)},
+            headers={
+                **HEADERS,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Origin": origin,
+                "Referer": listing_url,
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests_exceptions.Timeout:
+        out["probe_status"] = f"{SOBRESSAI_GQL_PROBE_HTTP}:timeout"
+        return out
+    except (requests_exceptions.RequestException, OSError):
+        out["probe_status"] = SOBRESSAI_GQL_PROBE_FAILED
+        return out
+    out["http_status"] = r.status_code
+    if r.status_code != 200:
+        out["probe_status"] = f"{SOBRESSAI_GQL_PROBE_HTTP}:{r.status_code}"
+        return out
+    try:
+        body = r.json()
+    except json.JSONDecodeError:
+        out["probe_status"] = SOBRESSAI_GQL_PROBE_SCHEMA
+        return out
+    if not isinstance(body, dict):
+        out["probe_status"] = SOBRESSAI_GQL_PROBE_SCHEMA
+        return out
+    if body.get("errors"):
+        out["probe_status"] = SOBRESSAI_GQL_PROBE_ERRORS
+        return out
+    data = body.get("data") or {}
+    block = data.get("imoveis")
+    if not isinstance(block, dict):
+        out["probe_status"] = SOBRESSAI_GQL_PROBE_SCHEMA
+        return out
+    items = block.get("imoveis")
+    if not isinstance(items, list):
+        out["probe_status"] = SOBRESSAI_GQL_PROBE_SCHEMA
+        return out
+    if len(items) == 0:
+        out["probe_status"] = SOBRESSAI_GQL_PROBE_EMPTY
+        out["ok"] = True
+        return out
+    out["probe_status"] = SOBRESSAI_GQL_PROBE_OK
+    out["ok"] = True
+    return out
+
+
+def _imovel_dict_from_sobressai_gql(
+    row: dict[str, Any], site: dict, origin: str
+) -> dict[str, Any] | None:
+    iid = row.get("id")
+    if iid is None:
+        return None
+    codigo = str(iid).strip()
+    titulo = (row.get("titulo") or "").strip() or f"Imóvel {codigo}"
+    detail = f"{origin.rstrip('/')}/imoveis/{codigo}"
+    pv = row.get("preco_venda")
+    preco = None
+    preco_texto = ""
+    if pv is not None:
+        try:
+            pf = float(pv)
+            if pf > 0:
+                preco = pf
+                preco_texto = f"R$ {pf:,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
+        except (TypeError, ValueError):
+            preco_texto = str(pv).strip()
+            preco = parse_preco(preco_texto) if preco_texto else None
+    bairro = ""
+    cidade = ""
+    br = row.get("bairro")
+    if isinstance(br, dict):
+        bairro = (br.get("nome") or "").strip()[:120]
+    cd = row.get("cidade")
+    if isinstance(cd, dict):
+        cidade = (cd.get("nome") or "").strip()[:120]
+    tipo_nome = ""
+    tp = row.get("tipo")
+    if isinstance(tp, dict):
+        tipo_nome = (tp.get("nome") or "").strip()
+    area_m2 = None
+    for key in ("area_total", "area_privativa"):
+        av = row.get(key)
+        if av is not None:
+            try:
+                area_m2 = float(av)
+                if area_m2 > 0:
+                    break
+            except (TypeError, ValueError):
+                continue
+    q_raw = row.get("dormitorios")
+    quartos = None
+    if q_raw is not None and str(q_raw).strip().isdigit():
+        quartos = int(str(q_raw).strip())
+    foto = ""
+    fotos = row.get("fotos")
+    if isinstance(fotos, list) and fotos:
+        u = (fotos[0].get("url_foto") or "").strip() if isinstance(fotos[0], dict) else ""
+        if u:
+            foto = urljoin(origin + "/", u) if u.startswith("/") else u
+    endereco = (row.get("endereco") or "").strip()[:300]
+
+    return {
+        "site_id": site["id"],
+        "site_name": site["name"],
+        "titulo": titulo[:200],
+        "tipo": detect_tipo(f"{titulo} {tipo_nome}"),
+        "finalidade": "venda",
+        "preco_texto": preco_texto,
+        "preco": preco,
+        "area_m2": area_m2,
+        "quartos": quartos,
+        "banheiros": None,
+        "vagas": None,
+        "bairro": bairro,
+        "cidade": cidade,
+        "endereco": endereco,
+        "descricao": "",
+        "url_anuncio": detail,
+        "url_foto": foto[:500] if foto else "",
+        "codigo": codigo,
+    }
+
+
+def extract_imoveis_sobressai_graphql(
+    session: requests.Session,
+    listing_url: str,
+    site: dict,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    meta_out: dict[str, Any] = {
+        "pagination_pattern": "sobressai_gql_pagina_qtd_pag",
+        "pages_fetched": 0,
+        "total_items": 0,
+        "detail_links": 0,
+        "validation_reason": "",
+        "last_error": "",
+        "stop_reason": "",
+        "gql_url": _sobressai_gql_url(listing_url),
+    }
+    pu = urlparse(listing_url)
+    origin = f"{pu.scheme or 'https'}://{pu.netloc}".rstrip("/")
+    seen: set[str] = set()
+    all_items: list[dict[str, Any]] = []
+    page = 1
+
+    while page <= MAX_PAGES_PER_SITE:
+        try:
+            r = session.post(
+                meta_out["gql_url"],
+                json={"query": _sobressai_gql_listing_body(page, SOBRESSAI_GQL_PAGE_SIZE)},
+                headers={
+                    **HEADERS,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "Origin": origin,
+                    "Referer": listing_url,
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests_exceptions.Timeout:
+            meta_out["last_error"] = "timeout"
+            meta_out["stop_reason"] = "sobressai_gql_timeout"
+            break
+        except (requests_exceptions.RequestException, OSError) as e:
+            et, em = format_exception(e)
+            meta_out["last_error"] = f"{et}: {em}"
+            meta_out["stop_reason"] = "sobressai_gql_request_error"
+            break
+        if r.status_code != 200:
+            meta_out["last_error"] = f"http_{r.status_code}"
+            meta_out["stop_reason"] = "sobressai_gql_http"
+            break
+        try:
+            body = r.json()
+        except json.JSONDecodeError:
+            meta_out["last_error"] = "invalid_json"
+            meta_out["stop_reason"] = "sobressai_gql_json"
+            break
+        if not isinstance(body, dict) or body.get("errors"):
+            meta_out["last_error"] = str(body.get("errors") or body)[:500]
+            meta_out["stop_reason"] = "sobressai_gql_errors"
+            break
+        data = body.get("data") or {}
+        block = data.get("imoveis")
+        if not isinstance(block, dict):
+            meta_out["stop_reason"] = "sobressai_gql_schema"
+            break
+        batch = block.get("imoveis")
+        if not isinstance(batch, list):
+            meta_out["stop_reason"] = "sobressai_gql_schema"
+            break
+        meta_out["pages_fetched"] = page
+        if not batch:
+            meta_out["stop_reason"] = "sobressai_gql_empty_page"
+            break
+        new_n = 0
+        for row in batch:
+            if not isinstance(row, dict):
+                continue
+            it = _imovel_dict_from_sobressai_gql(row, site, origin)
+            if not it:
+                continue
+            cid = it.get("codigo") or ""
+            if cid in seen:
+                continue
+            seen.add(cid)
+            all_items.append(it)
+            new_n += 1
+        if new_n == 0:
+            meta_out["stop_reason"] = "sobressai_gql_no_new"
+            break
+        if len(batch) < SOBRESSAI_GQL_PAGE_SIZE:
+            meta_out["stop_reason"] = "sobressai_gql_last_page"
+            break
+        page += 1
+
+    meta_out["total_items"] = len(all_items)
+    meta_out["detail_links"] = sum(1 for x in all_items if x.get("url_anuncio"))
+    if not meta_out["stop_reason"] and all_items:
+        meta_out["stop_reason"] = "sobressai_gql_completed"
+    meta_out["validation_reason"] = (
+        "sobressai_graphql"
+        if all_items
+        else (meta_out.get("last_error") or meta_out.get("stop_reason") or "sobressai_empty")
+    )
+    log.info(
+        "Sobressai GraphQL: %s — %s imóveis | páginas=%s | stop=%s",
+        site["name"],
+        meta_out["total_items"],
+        meta_out["pages_fetched"],
+        meta_out.get("stop_reason") or "?",
+    )
+    return all_items, meta_out
+
+
 def detect_platform_family(
     listing_url: str, html: str | None, session: requests.Session
 ) -> tuple[str, dict[str, Any]]:
@@ -1908,8 +2224,10 @@ def detect_platform_family(
     ``imoview_imoveis_ajax`` quando a URL segue ``/(venda|aluguel)/imoveis/…`` e o POST
     ``/imoveis/ajax/`` devolve JSON com ``lista``. ``retornar_imoveis_disponiveis`` quando o HTML
     carrega ``objImovel.js`` (ou cita ``retornar-imoveis-disponiveis``) e o POST no mesmo host
-    devolve JSON com ``lista`` e ``quantidade``. ``php_acao_atualiza_imoveis`` quando o HTML
+    devolve JSON com ``lista`` e ``quantidade``.     ``php_acao_atualiza_imoveis`` quando o HTML
     referencia ``acao-atualiza-imoveis.php`` e o GET com ``offset`` retorna JSON com ``results``.
+    ``sobressai_graphql`` quando o HTML cita Sobressai/imobtotal e o POST ``/api/gql`` com
+    ``Query.imoveis`` devolve listagem.
     """
     diag: dict[str, Any] = {
         "listing_url_signal": False,
@@ -1934,6 +2252,8 @@ def detect_platform_family(
         "retornar_imoveis_html_signal": False,
         "retornar_imoveis_probe_used": False,
         "retornar_imoveis_probe_status": "",
+        "sobressai_gql_probe_used": False,
+        "sobressai_gql_probe_status": "",
     }
     if PLAYWRIGHT_ENABLED:
         h = _normalized_listing_host(listing_url)
@@ -1966,6 +2286,13 @@ def detect_platform_family(
         diag["vista_busca_finalidade"] = str(vprobe.get("finalidade") or "sale")
         if vprobe.get("ok"):
             return PLATFORM_FAMILY_VISTA_WEB_API, diag
+
+    if html and listing_html_signals_sobressai(html):
+        diag["sobressai_gql_probe_used"] = True
+        sprobe = probe_sobressai_graphql(session, listing_url)
+        diag["sobressai_gql_probe_status"] = str(sprobe.get("probe_status") or "")
+        if sprobe.get("ok"):
+            return PLATFORM_FAMILY_SOBRESSAI_GRAPHQL, diag
 
     if listing_url_signals_imoview_imoveis_ajax(listing_url):
         diag["imoview_ajax_probe_used"] = True
@@ -3740,6 +4067,7 @@ def _register_api_first_families() -> None:
     API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_RETORNAR_IMOVEIS_DISPONIVEIS] = (
         extract_imoveis_retornar_imoveis_disponiveis
     )
+    API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_SOBRESSAI_GRAPHQL] = extract_imoveis_sobressai_graphql
 
 
 _register_api_first_families()
@@ -3782,6 +4110,8 @@ def dispatch_api_first_family_extract(
         return extract_imoveis_php_acao_atualiza_imoveis(session, listing_url, site)
     if family == PLATFORM_FAMILY_RETORNAR_IMOVEIS_DISPONIVEIS:
         return extract_imoveis_retornar_imoveis_disponiveis(session, listing_url, site)
+    if family == PLATFORM_FAMILY_SOBRESSAI_GRAPHQL:
+        return extract_imoveis_sobressai_graphql(session, listing_url, site)
     return None
 
 
@@ -5693,6 +6023,33 @@ def apply_site_removals_with_guard(
 # SCRAPING DE UM SITE
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _suppress_queda_abrupta_for_high_volume(
+    baseline_row: dict | None,
+    volume_total: int,
+) -> bool:
+    """
+    Evita falso ``SUSPEITO_QUEDA_ABRUPTA`` quando a coleta já cobriu catálogo grande:
+    o HTML pode ainda indicar “próxima página” enquanto a grade real acabou.
+    """
+    v = int(volume_total or 0)
+    if v <= 0:
+        return False
+    br = baseline_row or {}
+    cnt = int(br.get("healthy_runs_count") or 0)
+    avg_raw = br.get("avg_healthy_volume_total")
+    try:
+        avg_f = float(avg_raw) if avg_raw is not None else 0.0
+    except (TypeError, ValueError):
+        avg_f = 0.0
+    if cnt > 0 and avg_f > 0:
+        threshold = max(
+            QUEDA_ABRUPTA_SUPPRESS_MIN_VOLUME,
+            int(avg_f * QUEDA_ABRUPTA_SUPPRESS_BASELINE_MIN_RATIO),
+        )
+        return v >= threshold
+    return v >= QUEDA_ABRUPTA_SUPPRESS_NO_BASELINE_VOLUME
+
+
 def _unpack_baseline_for_resolve(
     baseline_row: dict | None,
 ) -> tuple[bool, int | None, int | None, int]:
@@ -6316,6 +6673,32 @@ def scrape_site(
                             ensure_ascii=False,
                         )
                     )
+                elif plat_fam == PLATFORM_FAMILY_SOBRESSAI_GRAPHQL:
+                    _pair = dispatch_api_first_family_extract(
+                        PLATFORM_FAMILY_SOBRESSAI_GRAPHQL,
+                        session,
+                        url_final,
+                        site,
+                    )
+                    imoveis_pagina, api_meta = (
+                        _pair if _pair is not None else ([], {"validation_reason": "dispatch_returned_none"})
+                    )
+                    used_api_first_listing = True
+                    summary.family_specific_extractor_used = True
+                    summary.family_card_count = int(api_meta.get("total_items") or 0)
+                    summary.family_detail_links_count = int(api_meta.get("detail_links") or 0)
+                    summary.family_pagination_pattern_detected = str(
+                        api_meta.get("pagination_pattern") or ""
+                    )
+                    summary.family_listing_validation_reason = str(
+                        api_meta.get("validation_reason") or ""
+                    )
+                    summary.notes.append(
+                        json.dumps(
+                            {"sobressai_graphql": api_meta, "family_detection": fam_diag},
+                            ensure_ascii=False,
+                        )
+                    )
                 elif plat_fam == PLATFORM_FAMILY_IMOVIEW_IMOVEIS_AJAX:
                     _pair = dispatch_api_first_family_extract(
                         PLATFORM_FAMILY_IMOVIEW_IMOVEIS_AJAX,
@@ -6553,6 +6936,19 @@ def scrape_site(
             time.sleep(0.8)
 
         baseline_row = get_site_baseline(conn, site["id"])
+        if queda_abrupta and _suppress_queda_abrupta_for_high_volume(
+            baseline_row, stats["total"]
+        ):
+            log.info(
+                "Queda abrupta (paginação) ignorada para %s: volume_total=%s já é confiável",
+                site["name"],
+                stats["total"],
+            )
+            summary.warnings.append(
+                "Paginação: página vazia após indicador de mais resultados, "
+                f"mas volume_total={stats['total']} acima do limiar de confiança."
+            )
+            queda_abrupta = False
         b_avail, bmin, bmax, hcnt = _unpack_baseline_for_resolve(baseline_row)
         extraction, status_source = resolve_final_extraction_status(
             had_request_error=had_request_error,
@@ -6778,9 +7174,9 @@ def sync_supabase(
 
     if not SUPABASE_SYNC_ENABLED:
         log.warning(
-            "SYNC BLOQUEADO: Supabase não configurado (SUPABASE_URL/SUPABASE_KEY ausentes)"
+            "SYNC BLOQUEADO: Supabase não configurado (URL do projeto ou chave de serviço ausente)"
         )
-        log.info("  Supabase sync desabilitado (SUPABASE_URL/SUPABASE_KEY não configurados)")
+        log.info("  Supabase sync desabilitado (credenciais Supabase não configuradas)")
         return {
             **base_meta,
             "enviados": 0,
