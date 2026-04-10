@@ -287,6 +287,14 @@ PLAYWRIGHT_LOFT_HOSTS = frozenset(
         "girolla.com.br",
     }
 )
+# Kenlo Digital Place (widget static-sites.kenlo.io): listagem hidratada + botão «Ver mais».
+PLAYWRIGHT_KENLO_HOSTS = frozenset(
+    {
+        "sollusimobiliaria.com.br",
+        "imobiliariapradi.com.br",
+        "divinacasaimobiliaria.com.br",
+    }
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -584,14 +592,31 @@ def migrate_imoveis_field_quality(conn):
 # EXTRATORES — detecta padrões comuns de sistemas imobiliários
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+class ListingPaginationEnd(Exception):
+    """Servidor respondeu redirect para URL inválida (bug de template) — fim seguro da listagem."""
+
+
 def fetch_page(url, session) -> tuple[str, str]:
     """Faz a requisição HTTP com retry simples. Retorna (html, url_final após redirects)."""
     for attempt in range(3):
         try:
-            r = session.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            r = session.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=False)
+            hops = 0
+            while r.is_redirect and hops < 24:
+                hops += 1
+                loc = (r.headers.get("Location") or "").strip()
+                if not loc:
+                    break
+                nxt = urljoin(r.url, loc)
+                if _pagination_next_url_corrupt(urlparse(nxt).netloc):
+                    raise ListingPaginationEnd()
+                r = session.get(nxt, headers=HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=False)
             r.raise_for_status()
             r.encoding = r.apparent_encoding or "utf-8"
             return r.text, r.url
+        except ListingPaginationEnd:
+            raise
         except Exception as e:
             if attempt == 2:
                 raise
@@ -1466,6 +1491,109 @@ def extract_imoveis_loft_playwright(site: dict) -> tuple[list[dict], dict]:
     return all_items, meta
 
 
+def extract_imoveis_kenlo_playwright(site: dict) -> tuple[list[dict], dict]:
+    """
+    Kenlo Digital Place: cards com links ``/imovel/…`` após hidratação; paginação por botão «Ver mais».
+    """
+    meta: dict[str, Any] = {
+        "pages_attempted": 1,
+        "pages_succeeded": 0,
+        "playwright_error_type": None,
+        "playwright_error_message": None,
+        "stop_reason": "",
+        "render_fallback": False,
+        "load_more_clicks": 0,
+    }
+    if not PLAYWRIGHT_ENABLED:
+        log.warning(
+            "    %s: PLAYWRIGHT_ENABLED=false — listagem Kenlo não será renderizada.",
+            site.get("name", "?"),
+        )
+        meta["render_fallback"] = True
+        meta["stop_reason"] = "playwright_disabled"
+        return [], meta
+    if not PLAYWRIGHT_AVAILABLE:
+        log.warning(
+            "    %s: Playwright não instalado — listagem Kenlo requer Chromium.",
+            site.get("name", "?"),
+        )
+        meta["render_fallback"] = True
+        meta["stop_reason"] = "playwright_unavailable"
+        return [], meta
+
+    listing = (site.get("url") or "").strip()
+    if not listing:
+        meta["playwright_error_type"] = "InvalidArgument"
+        meta["playwright_error_message"] = "URL de listagem vazia"
+        return [], meta
+
+    log.info("    %s: Playwright (Kenlo) — %s", site["name"], listing[:88])
+
+    def _count_imovel_hrefs(html: str) -> int:
+        return len(
+            {
+                x
+                for x in re.findall(r'href="([^"]+)"', html)
+                if "/imovel/" in x.lower()
+            }
+        )
+
+    try:
+        with playwright_browser_page() as page:
+            if page is None:
+                meta["render_fallback"] = True
+                meta["stop_reason"] = "playwright_slot_unavailable"
+                return [], meta
+            _playwright_goto_listing(page, listing)
+            _playwright_dismiss_cookies(page)
+            page.wait_for_timeout(3500)
+
+            stagnant = 0
+            for click_i in range(60):
+                try:
+                    btn = page.locator("button.btn-next").filter(has_text="Ver mais").first
+                    if not btn.is_visible(timeout=2500):
+                        meta["stop_reason"] = meta["stop_reason"] or "ver_mais_not_visible"
+                        break
+                    prev_n = _count_imovel_hrefs(page.content())
+                    btn.click(timeout=12000)
+                    page.wait_for_timeout(2600)
+                    cur_n = _count_imovel_hrefs(page.content())
+                    meta["load_more_clicks"] += 1
+                    if cur_n <= prev_n:
+                        stagnant += 1
+                        if stagnant >= 2:
+                            meta["stop_reason"] = "no_new_after_ver_mais"
+                            break
+                    else:
+                        stagnant = 0
+                except Exception:
+                    meta["stop_reason"] = meta["stop_reason"] or "ver_mais_click_end"
+                    break
+
+            html = page.content()
+            base_u = page.url or listing
+            all_items = _extract_loft_cards_from_html(html, base_u, site)
+            meta["pages_succeeded"] = 1 if all_items else 0
+            if not meta["stop_reason"]:
+                meta["stop_reason"] = "kenlo_completed"
+
+    except Exception as e:
+        et, em = format_exception(e)
+        meta["playwright_error_type"] = et
+        meta["playwright_error_message"] = em
+        log.error("    %s Playwright (Kenlo): erro [%s] — %s", site["name"], et, em)
+        return [], meta
+
+    log.info(
+        "    %s Playwright (Kenlo): total = %s imóveis (cliques Ver mais=%s)",
+        site["name"],
+        len(all_items),
+        meta["load_more_clicks"],
+    )
+    return all_items, meta
+
+
 def scrape_itaivan_playwright(site: dict, max_pages: int | None = None) -> tuple[list[dict], dict]:
     """
     Scraper dedicado para Itaivan usando Playwright (site renderizado por JS).
@@ -1720,6 +1848,7 @@ PLATFORM_FAMILY_GERENCIAR_IMOVEIS_CF = "gerenciarimoveis_cf"
 PLATFORM_FAMILY_VISTA_WEB_API = "vista_web_api"
 PLATFORM_FAMILY_APREME_PLAYWRIGHT = "apreme_playwright"
 PLATFORM_FAMILY_LOFT_PLAYWRIGHT = "loft_playwright"
+PLATFORM_FAMILY_KENLO_PLAYWRIGHT = "kenlo_playwright"
 PLATFORM_FAMILY_IMOVIEW_IMOVEIS_AJAX = "imoview_imoveis_ajax"
 PLATFORM_FAMILY_PHP_ACAO_ATUALIZA_IMOVEIS = "php_acao_atualiza_imoveis"
 # Imoview site próprio (objImovel.js): POST form ``/retornar-imoveis-disponiveis`` → JSON lista + quantidade
@@ -2262,6 +2391,8 @@ def detect_platform_family(
             return PLATFORM_FAMILY_APREME_PLAYWRIGHT, diag
         if h in PLAYWRIGHT_LOFT_HOSTS:
             return PLATFORM_FAMILY_LOFT_PLAYWRIGHT, diag
+        if h in PLAYWRIGHT_KENLO_HOSTS:
+            return PLATFORM_FAMILY_KENLO_PLAYWRIGHT, diag
 
     if listing_url_signals_gerenciar_imoveis_cf(listing_url):
         diag["listing_url_signal"] = True
@@ -4060,6 +4191,7 @@ def _register_api_first_families() -> None:
     API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_GERENCIAR_IMOVEIS_CF] = extract_imoveis_gerenciar_imoveis_cf_api
     API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_APREME_PLAYWRIGHT] = extract_imoveis_apreme_playwright
     API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_LOFT_PLAYWRIGHT] = extract_imoveis_loft_playwright
+    API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_KENLO_PLAYWRIGHT] = extract_imoveis_kenlo_playwright
     API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_IMOVIEW_IMOVEIS_AJAX] = extract_imoveis_imoview_imoveis_ajax_api
     API_FIRST_FAMILY_REGISTRY[PLATFORM_FAMILY_PHP_ACAO_ATUALIZA_IMOVEIS] = (
         extract_imoveis_php_acao_atualiza_imoveis
@@ -4104,6 +4236,8 @@ def dispatch_api_first_family_extract(
         return extract_imoveis_apreme_playwright(site)
     if family == PLATFORM_FAMILY_LOFT_PLAYWRIGHT:
         return extract_imoveis_loft_playwright(site)
+    if family == PLATFORM_FAMILY_KENLO_PLAYWRIGHT:
+        return extract_imoveis_kenlo_playwright(site)
     if family == PLATFORM_FAMILY_IMOVIEW_IMOVEIS_AJAX:
         return extract_imoveis_imoview_imoveis_ajax_api(session, listing_url, site)
     if family == PLATFORM_FAMILY_PHP_ACAO_ATUALIZA_IMOVEIS:
@@ -4707,6 +4841,14 @@ def _listing_page_number_from_url(url: str) -> int:
     return 1
 
 
+def _pagination_next_url_corrupt(netloc: str) -> bool:
+    """
+    Alguns templates colocam ``pagina-N`` colado ao host (ex.: ``dominio.com.br-pagina-2``),
+    gerando netloc inválido. ``rel=next``/âncoras assim quebram o fetch (DNS).
+    """
+    return "-pagina-" in (netloc or "").strip().lower()
+
+
 def discover_next_listing_page_from_anchors(
     html: str, current_url: str, next_page_index: int
 ) -> str | None:
@@ -4777,6 +4919,8 @@ def discover_next_listing_page_from_anchors(
                 and page_n >= next_page_index
                 and hosts_compatible(current_url, cand_url)
             ):
+                if _pagination_next_url_corrupt(urlparse(cand_url).netloc):
+                    continue
                 clean = cand_url.split("#")[0]
                 if clean.rstrip("/") != current_url.split("#")[0].rstrip("/"):
                     candidates.append((page_n, clean))
@@ -4840,18 +4984,13 @@ def get_next_page_url(html: str, current_url: str, page_num: int) -> str | None:
       - Query string: ?page=2, ?pagina=2, ?pg=2
       - Offset:       ?offset=21&limit=21
       - Path barra:   /page/2/, /pagina/2/
+
+    Prioriza incremento pela **URL atual** (path/query) antes de ``rel=next``/âncoras, pois
+    alguns sites publicam ``rel=next`` com URL malformada enquanto o path ``/pagina-N`` é correto.
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1) Link rel="next" explícito — mais confiável
-    for sel in ["a[rel='next']", "link[rel='next']"]:
-        el = soup.select_one(sel)
-        if el and el.get("href"):
-            next_url = urljoin(current_url, el["href"])
-            if next_url != current_url and hosts_compatible(current_url, next_url):
-                return next_url
-
-    # 2) Query string na URL atual: ?page=N, ?pagina=N, ?pag=N, ?pg=N
+    # 1) Query string na URL atual: ?page=N, ?pagina=N, ?pag=N, ?pg=N
     for pattern in [r"([?&])(pagina|page|pag|pg|p)=(\d+)"]:
         m = re.search(pattern, current_url, re.I)
         if m:
@@ -4859,7 +4998,7 @@ def get_next_page_url(html: str, current_url: str, page_num: int) -> str | None:
             new_val = old_val + 1
             return current_url[:m.start(1)] + m.group(1) + m.group(2) + "=" + str(new_val) + current_url[m.end():]
 
-    # 3) Offset: ?offset=N&limit=M  (Kenlo, mouraimoveis, etc.)
+    # 2) Offset: ?offset=N&limit=M  (Kenlo, mouraimoveis, etc.)
     m = re.search(r"([?&])(offset)=(\d+)", current_url, re.I)
     if m:
         old_val = int(m.group(3))
@@ -4868,19 +5007,19 @@ def get_next_page_url(html: str, current_url: str, page_num: int) -> str | None:
         new_val = old_val + step
         return current_url[:m.start(1)] + m.group(1) + "offset=" + str(new_val) + current_url[m.end():]
 
-    # 4) Padrão /pagina-N (hífen)
+    # 3) Padrão /pagina-N (hífen)
     m = re.search(r"/pagina-(\d+)(/|$)", current_url, re.I)
     if m:
         new_num = int(m.group(1)) + 1
         return current_url[:m.start()] + f"/pagina-{new_num}" + m.group(2)
 
-    # 5) Path /page/N/ ou /pagina/N/
+    # 4) Path /page/N/ ou /pagina/N/
     m = re.search(r"/(page|pagina)/(\d+)(/|$)", current_url, re.I)
     if m:
         new_num = int(m.group(2)) + 1
         return current_url[:m.start()] + f"/{m.group(1)}/{new_num}" + m.group(3)
 
-    # 6) Path numérico no final: /imoveis/venda/2
+    # 5) Path numérico no final: /imoveis/venda/2
     m = re.search(r"/(\d+)(/?)$", current_url)
     if m:
         cur_num = int(m.group(1))
@@ -4888,9 +5027,18 @@ def get_next_page_url(html: str, current_url: str, page_num: int) -> str | None:
             new_num = cur_num + 1
             return current_url[:m.start()] + f"/{new_num}" + m.group(2)
 
+    # 6) Link rel="next" — ignora href com host corrompido (ex.: engetecimoveis)
+    for sel in ["a[rel='next']", "link[rel='next']"]:
+        el = soup.select_one(sel)
+        if el and el.get("href"):
+            next_url = urljoin(current_url, el["href"])
+            if next_url != current_url and hosts_compatible(current_url, next_url):
+                if not _pagination_next_url_corrupt(urlparse(next_url).netloc):
+                    return next_url
+
     # 7) Links reais no HTML (``&pagina=2``, ``//host/...``, ``javascript:paginacao(...)``)
     found = discover_next_listing_page_from_anchors(html, current_url, page_num)
-    if found:
+    if found and not _pagination_next_url_corrupt(urlparse(found).netloc):
         return found
 
     # 8) Heurísticas genéricas (somente mesmo site — evita links externos tipo bancos)
@@ -4905,7 +5053,11 @@ def get_next_page_url(html: str, current_url: str, page_num: int) -> str | None:
             href = el["href"].strip()
             if href and href != "#" and not href.lower().startswith("javascript:"):
                 next_url = urljoin(current_url, href)
-                if next_url != current_url and hosts_compatible(current_url, next_url):
+                if (
+                    next_url != current_url
+                    and hosts_compatible(current_url, next_url)
+                    and not _pagination_next_url_corrupt(urlparse(next_url).netloc)
+                ):
                     return next_url
 
     # 9) URL sem /pagina-N ainda → /pagina-2 se o HTML indicar esse padrão
@@ -6524,6 +6676,43 @@ def scrape_site(
                 pw_meta,
                 "loft_playwright",
             )
+        if pw_fam == PLATFORM_FAMILY_KENLO_PLAYWRIGHT:
+            summary.notes.append(
+                json.dumps({"playwright_family_detection": pw_fam_diag}, ensure_ascii=False)
+            )
+            pair = dispatch_api_first_family_extract(
+                PLATFORM_FAMILY_KENLO_PLAYWRIGHT,
+                session,
+                site["url"],
+                site,
+            )
+            imoveis_todos, pw_meta = (
+                pair
+                if pair is not None
+                else (
+                    [],
+                    {
+                        "render_fallback": True,
+                        "playwright_error_message": "dispatch_api_first_family_extract retornou None",
+                    },
+                )
+            )
+            return _scrape_site_finish_playwright_listing(
+                site,
+                conn,
+                agora,
+                t_mono,
+                stats,
+                summary,
+                hashes_vistos,
+                historico_dedupe,
+                run_id,
+                retry_context,
+                erro_msg_full,
+                imoveis_todos,
+                pw_meta,
+                "kenlo_playwright",
+            )
 
         # ── Fluxo normal (requests + BeautifulSoup) ───────────────────────────
         url = site["url"]
@@ -6536,6 +6725,12 @@ def scrape_site(
             summary.pages_attempted += 1
             try:
                 html, url_final = fetch_page(url, session)
+            except ListingPaginationEnd:
+                log.info(
+                    "    Listagem encerrada (redirect do servidor para URL inválida, típ. última página+1): %s",
+                    url[:90],
+                )
+                break
             except Exception as fetch_exc:
                 et, em = format_exception(fetch_exc)
                 summary.error_type = et
