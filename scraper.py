@@ -295,6 +295,11 @@ PLAYWRIGHT_KENLO_HOSTS = frozenset(
         "divinacasaimobiliaria.com.br",
     }
 )
+# «Ver mais» no Kenlo: ~15 itens por clique; 120 cliques cobre catálogos 500+.
+KENLO_VER_MAIS_MAX_CLICKS = 120
+# 2,5s+ evita falso «sem crescimento» quando o widget ainda hidrata cards.
+KENLO_VER_MAIS_CLICK_PAUSE_MS = 2600
+KENLO_VER_MAIS_STAGNANT_ROUNDS = 3
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -597,6 +602,50 @@ class ListingPaginationEnd(Exception):
     """Servidor respondeu redirect para URL inválida (bug de template) — fim seguro da listagem."""
 
 
+def _engetec_listing_page_index(listing_url: str) -> int | None:
+    pu = urlparse(listing_url)
+    if not (pu.netloc or "").lower().endswith("engetecimoveis.com.br"):
+        return None
+    path = (pu.path or "").rstrip("/")
+    if not path:
+        path = "/"
+    if re.fullmatch(r"/imoveis-venda", path, re.I):
+        return 1
+    m = re.search(r"/imoveis-venda-pagina-(\d+)$", path, re.I)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"/imoveis-venda/pagina-(\d+)$", path, re.I)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _engetec_next_listing_url(current_url: str) -> str | None:
+    """
+    Engetec: ``/imoveis-venda/pagina-N`` pode responder 302 com Location e host corrompido
+    além da última página; o padrão estável é ``/imoveis-venda-pagina-N``.
+    """
+    pu = urlparse(current_url)
+    if not (pu.netloc or "").lower().endswith("engetecimoveis.com.br"):
+        return None
+    path = (pu.path or "").rstrip("/")
+    if not path:
+        path = "/"
+    scheme = pu.scheme or "https"
+    netloc = pu.netloc
+    if re.fullmatch(r"/imoveis-venda", path, re.I):
+        return urlunparse((scheme, netloc, "/imoveis-venda-pagina-2", "", "", ""))
+    m = re.search(r"/imoveis-venda-pagina-(\d+)$", path, re.I)
+    if m:
+        n = int(m.group(1)) + 1
+        return urlunparse((scheme, netloc, f"/imoveis-venda-pagina-{n}", "", "", ""))
+    m = re.search(r"/imoveis-venda/pagina-(\d+)$", path, re.I)
+    if m:
+        n = int(m.group(1)) + 1
+        return urlunparse((scheme, netloc, f"/imoveis-venda-pagina-{n}", "", "", ""))
+    return None
+
+
 def fetch_page(url, session) -> tuple[str, str]:
     """Faz a requisição HTTP com retry simples. Retorna (html, url_final após redirects)."""
     for attempt in range(3):
@@ -609,9 +658,29 @@ def fetch_page(url, session) -> tuple[str, str]:
                 if not loc:
                     break
                 nxt = urljoin(r.url, loc)
-                if _pagination_next_url_corrupt(urlparse(nxt).netloc):
+                nxt_net = urlparse(nxt).netloc or ""
+                if _pagination_next_url_corrupt(nxt_net):
+                    mfix = re.search(r"-pagina-(\d+)$", nxt_net, re.I)
+                    base_h = nxt_net[: mfix.start()].rstrip("-") if mfix else ""
+                    if mfix and base_h.lower().endswith("engetecimoveis.com.br"):
+                        nxt = urlunparse(
+                            (
+                                urlparse(nxt).scheme or "https",
+                                base_h,
+                                f"/imoveis-venda-pagina-{int(mfix.group(1))}",
+                                "",
+                                "",
+                                "",
+                            )
+                        )
+                        r = session.get(nxt, headers=HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=False)
+                        continue
                     raise ListingPaginationEnd()
                 r = session.get(nxt, headers=HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=False)
+            req_e = _engetec_listing_page_index(url)
+            fin_e = _engetec_listing_page_index(r.url)
+            if req_e is not None and fin_e is not None and fin_e < req_e:
+                raise ListingPaginationEnd()
             r.raise_for_status()
             r.encoding = r.apparent_encoding or "utf-8"
             return r.text, r.url
@@ -1529,14 +1598,12 @@ def extract_imoveis_kenlo_playwright(site: dict) -> tuple[list[dict], dict]:
 
     log.info("    %s: Playwright (Kenlo) — %s", site["name"], listing[:88])
 
-    def _count_imovel_hrefs(html: str) -> int:
-        return len(
-            {
-                x
-                for x in re.findall(r'href="([^"]+)"', html)
-                if "/imovel/" in x.lower()
-            }
-        )
+    def _count_imovel_anchors_dom(page: Any) -> int:
+        """Conta âncoras de ficha no DOM (mais fiel que regex em ``page.content()`` após JS)."""
+        try:
+            return page.locator('a[href*="/imovel/"]').count()
+        except Exception:
+            return 0
 
     try:
         with playwright_browser_page() as page:
@@ -1546,23 +1613,38 @@ def extract_imoveis_kenlo_playwright(site: dict) -> tuple[list[dict], dict]:
                 return [], meta
             _playwright_goto_listing(page, listing)
             _playwright_dismiss_cookies(page)
-            page.wait_for_timeout(3500)
+            page.wait_for_timeout(4500)
+            try:
+                page.wait_for_function(
+                    "() => document.querySelectorAll('a[href*=\"/imovel/\"]').length >= 8",
+                    timeout=20000,
+                )
+            except Exception:
+                pass
 
             stagnant = 0
-            for click_i in range(60):
+            for click_i in range(KENLO_VER_MAIS_MAX_CLICKS):
                 try:
-                    btn = page.locator("button.btn-next").filter(has_text="Ver mais").first
-                    if not btn.is_visible(timeout=2500):
+                    btn = page.locator("button.btn-next").filter(has_text=re.compile(r"ver\s+mais", re.I)).first
+                    if not btn.is_visible(timeout=4000):
                         meta["stop_reason"] = meta["stop_reason"] or "ver_mais_not_visible"
                         break
-                    prev_n = _count_imovel_hrefs(page.content())
+                    prev_n = _count_imovel_anchors_dom(page)
+                    btn.scroll_into_view_if_needed()
                     btn.click(timeout=12000)
-                    page.wait_for_timeout(2600)
-                    cur_n = _count_imovel_hrefs(page.content())
+                    try:
+                        page.wait_for_function(
+                            "(n) => document.querySelectorAll('a[href*=\"/imovel/\"]').length > n",
+                            arg=prev_n,
+                            timeout=20000,
+                        )
+                    except Exception:
+                        page.wait_for_timeout(max(KENLO_VER_MAIS_CLICK_PAUSE_MS, 4500))
+                    cur_n = _count_imovel_anchors_dom(page)
                     meta["load_more_clicks"] += 1
                     if cur_n <= prev_n:
                         stagnant += 1
-                        if stagnant >= 2:
+                        if stagnant >= KENLO_VER_MAIS_STAGNANT_ROUNDS:
                             meta["stop_reason"] = "no_new_after_ver_mais"
                             break
                     else:
@@ -4528,11 +4610,33 @@ def extract_from_card(card, base_url: str, site: dict) -> dict:
         if m:
             preco_texto = m.group()
 
-    # URL do anúncio
+    # URL do anúncio — priorizar link de ficha (/imovel/…); o primeiro <a> costuma ser listagem/paginação.
     url_anuncio = ""
-    a_tag = card.find("a", href=True)
-    if a_tag:
-        url_anuncio = urljoin(base_url, a_tag["href"])
+    for a_tag in card.find_all("a", href=True):
+        raw = (a_tag.get("href") or "").strip()
+        if not raw or raw.startswith("#") or raw.lower().startswith("javascript:"):
+            continue
+        full = urljoin(base_url, raw.split("#")[0])
+        if "/imovel/" in ((urlparse(full).path or "").lower()):
+            url_anuncio = full
+            break
+    if not url_anuncio:
+        for a_tag in card.find_all("a", href=True):
+            raw = (a_tag.get("href") or "").strip()
+            if not raw or raw.startswith("#") or raw.lower().startswith("javascript:"):
+                continue
+            full = urljoin(base_url, raw.split("#")[0])
+            pl = (urlparse(full).path or "").lower()
+            if "/imoveis-venda" in pl or re.search(r"/pagina-\d+", pl):
+                continue
+            url_anuncio = full
+            break
+
+    pl_u = (urlparse(url_anuncio).path or "").lower() if url_anuncio else ""
+    if not url_anuncio or (
+        "/imovel/" not in pl_u and ("imoveis-venda" in pl_u or re.search(r"/pagina-\d+", pl_u))
+    ):
+        return None
 
     # Foto
     url_foto = ""
@@ -4829,6 +4933,9 @@ def _listing_page_number_from_url(url: str) -> int:
             except ValueError:
                 pass
     path = pu.path or ""
+    m = re.search(r"/imoveis-venda-pagina-(\d+)(?:/|$)", path, re.I)
+    if m:
+        return int(m.group(1))
     m = re.search(r"/pagina-(\d+)(/|$)", path, re.I)
     if m:
         return int(m.group(1))
@@ -5006,6 +5113,10 @@ def get_next_page_url(html: str, current_url: str, page_num: int) -> str | None:
         step = int(step_m.group(1)) if step_m else 21
         new_val = old_val + step
         return current_url[:m.start(1)] + m.group(1) + "offset=" + str(new_val) + current_url[m.end():]
+
+    enge_next = _engetec_next_listing_url(current_url)
+    if enge_next:
+        return enge_next
 
     # 3) Padrão /pagina-N (hífen)
     m = re.search(r"/pagina-(\d+)(/|$)", current_url, re.I)
