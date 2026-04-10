@@ -299,7 +299,11 @@ PLAYWRIGHT_KENLO_HOSTS = frozenset(
 KENLO_VER_MAIS_MAX_CLICKS = 120
 # 2,5s+ evita falso «sem crescimento» quando o widget ainda hidrata cards.
 KENLO_VER_MAIS_CLICK_PAUSE_MS = 2600
-KENLO_VER_MAIS_STAGNANT_ROUNDS = 3
+# Divina Casa: lotes lentos + botão ``disabled`` durante fetch — 3 rodadas parava em ~60.
+KENLO_VER_MAIS_STAGNANT_ROUNDS = 6
+KENLO_VER_MAIS_WAIT_DOM_MS = 30000
+KENLO_VER_MAIS_FALLBACK_PAUSE_MS = 6000
+KENLO_VER_MAIS_BTN_ENABLED_MS = 45000
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1617,38 +1621,68 @@ def extract_imoveis_kenlo_playwright(site: dict) -> tuple[list[dict], dict]:
             try:
                 page.wait_for_function(
                     "() => document.querySelectorAll('a[href*=\"/imovel/\"]').length >= 8",
-                    timeout=20000,
+                    timeout=KENLO_VER_MAIS_WAIT_DOM_MS,
                 )
             except Exception:
                 pass
 
             stagnant = 0
+            wf_ms = KENLO_VER_MAIS_WAIT_DOM_MS
+            fb_ms = max(KENLO_VER_MAIS_CLICK_PAUSE_MS, KENLO_VER_MAIS_FALLBACK_PAUSE_MS)
+            en_deadline = time.time() + KENLO_VER_MAIS_BTN_ENABLED_MS / 1000.0
             for click_i in range(KENLO_VER_MAIS_MAX_CLICKS):
                 try:
                     btn = page.locator("button.btn-next").filter(has_text=re.compile(r"ver\s+mais", re.I)).first
                     if not btn.is_visible(timeout=4000):
                         meta["stop_reason"] = meta["stop_reason"] or "ver_mais_not_visible"
                         break
+                    while time.time() < en_deadline:
+                        try:
+                            if btn.is_enabled():
+                                break
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(250)
+                    else:
+                        meta["stop_reason"] = meta["stop_reason"] or "ver_mais_stays_disabled"
+                        break
                     prev_n = _count_imovel_anchors_dom(page)
                     btn.scroll_into_view_if_needed()
-                    btn.click(timeout=12000)
+                    try:
+                        btn.click(timeout=12000)
+                    except Exception:
+                        page.wait_for_timeout(2000)
+                        continue
                     try:
                         page.wait_for_function(
                             "(n) => document.querySelectorAll('a[href*=\"/imovel/\"]').length > n",
                             arg=prev_n,
-                            timeout=20000,
+                            timeout=wf_ms,
                         )
                     except Exception:
-                        page.wait_for_timeout(max(KENLO_VER_MAIS_CLICK_PAUSE_MS, 4500))
+                        page.wait_for_timeout(fb_ms)
                     cur_n = _count_imovel_anchors_dom(page)
+                    if cur_n <= prev_n:
+                        page.wait_for_timeout(3500)
+                        cur_n = _count_imovel_anchors_dom(page)
                     meta["load_more_clicks"] += 1
                     if cur_n <= prev_n:
                         stagnant += 1
+                        log.info(
+                            "    %s Playwright (Kenlo): clique %s sem novo âncora (prev=%s cur=%s stagnant=%s/%s)",
+                            site["name"],
+                            meta["load_more_clicks"],
+                            prev_n,
+                            cur_n,
+                            stagnant,
+                            KENLO_VER_MAIS_STAGNANT_ROUNDS,
+                        )
                         if stagnant >= KENLO_VER_MAIS_STAGNANT_ROUNDS:
                             meta["stop_reason"] = "no_new_after_ver_mais"
                             break
                     else:
                         stagnant = 0
+                    en_deadline = time.time() + KENLO_VER_MAIS_BTN_ENABLED_MS / 1000.0
                 except Exception:
                     meta["stop_reason"] = meta["stop_reason"] or "ver_mais_click_end"
                     break
@@ -1668,10 +1702,11 @@ def extract_imoveis_kenlo_playwright(site: dict) -> tuple[list[dict], dict]:
         return [], meta
 
     log.info(
-        "    %s Playwright (Kenlo): total = %s imóveis (cliques Ver mais=%s)",
+        "    %s Playwright (Kenlo): total = %s imóveis (cliques Ver mais=%s, fim=%s)",
         site["name"],
         len(all_items),
         meta["load_more_clicks"],
+        meta.get("stop_reason") or "?",
     )
     return all_items, meta
 
