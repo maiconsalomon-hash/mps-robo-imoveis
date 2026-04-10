@@ -26,3 +26,7 @@ __pycache__/
 # Windows
 Thumbs.db
 desktop.ini
+
+Chave API KEY Railway.xlsx
+_diagnose_sites_fetch.py
+*.xlsx
